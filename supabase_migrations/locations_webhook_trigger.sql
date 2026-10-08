@@ -29,10 +29,9 @@ begin
       'type', 'INSERT',
       'table', 'locations',
       'schema', 'public',
-      'record', to_jsonb(NEW) || jsonb_build_object('created_at', now()),
+      'record', to_jsonb(NEW),
       'old_record', null
-    ),
-    timeout_milliseconds := 30000
+    )
   );
   return NEW;
 end;
