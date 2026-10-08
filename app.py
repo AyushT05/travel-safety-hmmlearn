@@ -21,17 +21,24 @@ always sends:
       "type": "INSERT",
       "table": "locations",
       "schema": "public",
-      "record": { "id": ..., "user_id": ..., "lat": ..., "lon": ...,
-                   "accuracy": ..., "speed": ..., "created_at": "..." },
+      "record": { "id": ..., "user_id": ..., "travel_card_id": ...,
+                   "lat": ..., "lon": ..., "accuracy": ..., "speed": ...,
+                   "created_at": "..." },
       "old_record": null
     }
 
 So the adaptation happens here, not in Supabase's config:
-  - trip_id in this file's state store is actually `user_id`. The
-    `locations` table has no travel_card/trip id column at all, only
-    `user_id`, and the app only supports one active trip per user at a
-    time (see ActiveTracking.js), so user_id is the correct, honest key
-    to track state under, not a workaround.
+  - trip_id in this file's state store is `travel_card_id` when present,
+    falling back to `user_id` only for older rows that predate the
+    add_travel_card_id_to_locations.sql migration. travel_card_id is the
+    correct key: it changes every time the person starts a genuinely new
+    trip, so a new trip automatically gets a fresh state_store row instead
+    of inheriting run-duration/state from whatever trip they were on last.
+    Keying on user_id alone (the original design, before that migration
+    existed) meant two completely unrelated trips from the same account
+    would silently share one continuous activity-duration counter, which
+    is exactly the bug this fallback chain now avoids for anyone updated
+    to send travel_card_id, while not breaking anyone still on old data.
   - `created_at` arrives as an ISO 8601 string and is converted to epoch
     seconds before being handed to pipeline.process_ping(), which only
     ever deals in plain numeric seconds.
@@ -49,9 +56,11 @@ On Render, the start command is:
 
 import os
 import pickle
+import base64
 from datetime import datetime, timezone
 from typing import Optional
 
+import pymupdf
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 
@@ -92,6 +101,7 @@ def _to_epoch_seconds(iso_timestamp: str) -> float:
 
 class LocationRecord(BaseModel):
     user_id: str
+    travel_card_id: Optional[str] = None
     lat: float
     lon: float
     accuracy: Optional[float] = None
@@ -115,6 +125,40 @@ def health():
     return {"status": "ok"}
 
 
+# -----------------------------------------------------------------------
+# PDF-to-image rendering for document verification. Unrelated to the HSMM
+# scoring; co-located only to avoid a second Render service. The
+# verify-document edge function calls this for PDF uploads because Groq's
+# vision endpoint accepts images only. Page 1 only (an ID is one page).
+# Same shared-secret header check as /score.
+# -----------------------------------------------------------------------
+
+class PdfRenderRequest(BaseModel):
+    pdfBase64: str
+    max_dimension: int = 1600
+    quality: int = 80
+
+
+@app.post("/pdf-to-image")
+def pdf_to_image(payload: PdfRenderRequest, x_webhook_secret: Optional[str] = Header(None)):
+    if WEBHOOK_SECRET and x_webhook_secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="invalid webhook secret")
+    try:
+        doc = pymupdf.open(stream=base64.b64decode(payload.pdfBase64), filetype="pdf")
+        if doc.page_count == 0:
+            raise HTTPException(status_code=400, detail="PDF has no pages")
+        page = doc[0]
+        scale = min(payload.max_dimension / max(page.rect.width, page.rect.height), 1.0)
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale))
+        jpeg = pix.tobytes("jpeg", jpg_quality=payload.quality)
+        doc.close()
+        return {"imageBase64": base64.b64encode(jpeg).decode("ascii"), "mimeType": "image/jpeg"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not render PDF: {e}")
+
+
 @app.post("/score")
 def score(payload: SupabaseWebhookPayload, x_webhook_secret: Optional[str] = Header(None)):
     if WEBHOOK_SECRET and x_webhook_secret != WEBHOOK_SECRET:
@@ -125,7 +169,7 @@ def score(payload: SupabaseWebhookPayload, x_webhook_secret: Optional[str] = Hea
         # locations, but don't trust configuration alone to guarantee that
         return {"skipped": True}
 
-    trip_id = payload.record.user_id
+    trip_id = payload.record.travel_card_id or payload.record.user_id
     t = _to_epoch_seconds(payload.record.created_at)
 
     state = STORE.load_state(trip_id)
