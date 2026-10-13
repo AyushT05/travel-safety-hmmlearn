@@ -21,6 +21,8 @@ SupabaseStateStore  - reads and writes a row per trip in a
 
 import json
 import os
+import time
+import uuid
 
 import httpx
 
@@ -64,6 +66,36 @@ class SupabaseStateStore:
             "Authorization": f"Bearer {self.service_key}",
             "Content-Type": "application/json",
         }
+
+    def _rpc(self, function_name, payload):
+        url = f"{self.base_url}/rest/v1/rpc/{function_name}"
+        resp = httpx.post(url, headers=self.headers, json=payload, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def acquire_trip_lock(self, trip_id, timeout_seconds=25, lease_seconds=300):
+        """Acquire a database-backed per-trip lease, shared across workers."""
+        token = str(uuid.uuid4())
+        deadline = time.monotonic() + timeout_seconds
+        delay = 0.1
+        while True:
+            acquired = self._rpc("try_acquire_trip_scoring_lock", {
+                "p_trip_id": trip_id,
+                "p_lock_token": token,
+                "p_lease_seconds": lease_seconds,
+            })
+            if acquired is True:
+                return token
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for scoring lock for trip {trip_id}")
+            time.sleep(delay)
+            delay = min(delay * 1.5, 0.75)
+
+    def release_trip_lock(self, trip_id, token):
+        self._rpc("release_trip_scoring_lock", {
+            "p_trip_id": trip_id,
+            "p_lock_token": token,
+        })
 
     def load_state(self, trip_id):
         url = f"{self.base_url}/rest/v1/trip_activity_state"

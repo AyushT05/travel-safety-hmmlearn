@@ -57,6 +57,9 @@ On Render, the start command is:
 import os
 import pickle
 import base64
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -90,6 +93,42 @@ else:
 # NOT fine once this is deployed and public).
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 
+# Local-only fallback lock. Production uses PostgreSQL-backed locks so requests
+# for the same trip serialize even across multiple Render workers/instances.
+_LOCAL_LOCKS = {}
+_LOCAL_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _trip_lock(trip_id):
+    if isinstance(STORE, SupabaseStateStore):
+        token = STORE.acquire_trip_lock(trip_id)
+        try:
+            yield
+        finally:
+            STORE.release_trip_lock(trip_id, token)
+    else:
+        with _LOCAL_LOCKS_GUARD:
+            lock = _LOCAL_LOCKS.setdefault(trip_id, threading.Lock())
+        acquired = lock.acquire(timeout=25)
+        if not acquired:
+            raise TimeoutError(f"Timed out waiting for local scoring lock for trip {trip_id}")
+        try:
+            yield
+        finally:
+            lock.release()
+
+
+def _check_webhook_secret(provided):
+    # Fail closed in production: a public scoring endpoint must never silently
+    # disable authentication because WEBHOOK_SECRET was omitted.
+    if not WEBHOOK_SECRET:
+        if os.environ.get("RENDER") or os.environ.get("SUPABASE_URL"):
+            raise HTTPException(status_code=503, detail="WEBHOOK_SECRET is not configured")
+        return
+    if provided != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="invalid webhook secret")
+
 
 def _to_epoch_seconds(iso_timestamp: str) -> float:
     # Supabase sends e.g. "2026-09-17T05:12:03.482+00:00"
@@ -100,6 +139,7 @@ def _to_epoch_seconds(iso_timestamp: str) -> float:
 
 
 class LocationRecord(BaseModel):
+    id: Optional[int] = None
     user_id: str
     travel_card_id: Optional[str] = None
     lat: float
@@ -141,8 +181,7 @@ class PdfRenderRequest(BaseModel):
 
 @app.post("/pdf-to-image")
 def pdf_to_image(payload: PdfRenderRequest, x_webhook_secret: Optional[str] = Header(None)):
-    if WEBHOOK_SECRET and x_webhook_secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="invalid webhook secret")
+    _check_webhook_secret(x_webhook_secret)
     try:
         doc = pymupdf.open(stream=base64.b64decode(payload.pdfBase64), filetype="pdf")
         if doc.page_count == 0:
@@ -161,35 +200,72 @@ def pdf_to_image(payload: PdfRenderRequest, x_webhook_secret: Optional[str] = He
 
 @app.post("/score")
 def score(payload: SupabaseWebhookPayload, x_webhook_secret: Optional[str] = Header(None)):
-    if WEBHOOK_SECRET and x_webhook_secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="invalid webhook secret")
+    _check_webhook_secret(x_webhook_secret)
 
     if payload.type != "INSERT" or payload.table != "locations":
-        # defensive: the webhook is configured to only fire on INSERT into
-        # locations, but don't trust configuration alone to guarantee that
-        return {"skipped": True}
+        return {"skipped": True, "reason": "unsupported webhook event"}
 
     trip_id = payload.record.travel_card_id or payload.record.user_id
     t = _to_epoch_seconds(payload.record.created_at)
+    location_id = payload.record.id
 
-    state = STORE.load_state(trip_id)
-    if state is None:
-        state = initial_state()
+    # The lock covers load -> infer -> save as one critical section. This is a
+    # distributed PostgreSQL lease in production, not merely a process mutex.
+    try:
+        with _trip_lock(trip_id):
+            state = STORE.load_state(trip_id)
+            if state is None:
+                state = initial_state()
 
-    new_state, result = process_ping(
-        state,
-        {"t": t, "lat": payload.record.lat, "lon": payload.record.lon},
-        MODEL,
-        FITTED_DURATIONS,
-    )
+            # Webhook delivery can be concurrent or out of order. Location IDs
+            # are monotonically increasing, so ignore duplicate/older events.
+            last_id = state.get("last_location_id")
+            last_t = state.get("last_ping_t")
+            if location_id is not None and last_id is not None and location_id <= last_id:
+                return {"trip_id": trip_id, "skipped": True, "reason": "duplicate_or_out_of_order", "location_id": location_id}
+            if location_id is None and last_t is not None and t <= last_t:
+                return {"trip_id": trip_id, "skipped": True, "reason": "duplicate_or_out_of_order"}
 
-    if isinstance(STORE, SupabaseStateStore):
-        STORE.save_state(trip_id, new_state, score=result)
-    else:
-        STORE.save_state(trip_id, new_state)
+            new_state, result = process_ping(
+                state,
+                {"t": t, "lat": payload.record.lat, "lon": payload.record.lon},
+                MODEL,
+                FITTED_DURATIONS,
+            )
+            new_state["last_ping_t"] = t
+            if location_id is not None:
+                new_state["last_location_id"] = location_id
 
-    return {
-        "trip_id": trip_id,
-        "buffering": result is None,
-        "score": result,
-    }
+            if isinstance(STORE, SupabaseStateStore):
+                STORE.save_state(trip_id, new_state, score=result)
+            else:
+                STORE.save_state(trip_id, new_state)
+
+            return {
+                "trip_id": trip_id,
+                "location_id": location_id,
+                "buffering": result is None,
+                "score": result,
+            }
+    except TimeoutError as exc:
+        # A non-2xx response lets the caller/logging identify contention rather
+        # than silently processing against stale state.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/check-dropouts")
+def check_dropouts(x_webhook_secret: Optional[str] = Header(None)):
+    """Run one dropout check; Supabase pg_cron invokes this periodically.
+
+    The database migration owns the actual stale-trip query and idempotency.
+    This endpoint is intentionally thin so the SQL function is also callable
+    directly for manual testing.
+    """
+    _check_webhook_secret(x_webhook_secret)
+    if not isinstance(STORE, SupabaseStateStore):
+        raise HTTPException(status_code=503, detail="Supabase state store is not configured")
+    try:
+        result = STORE._rpc("check_location_dropouts", {})
+        return {"ok": True, "result": result}
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Dropout check failed") from exc
