@@ -177,6 +177,67 @@ class SupabaseWebhookPayload(BaseModel):
         populate_by_name = True
 
 
+# -----------------------------------------------------------------------
+# Incident agent (see agent/). Deterministic signal fusion decides; the LLM only
+# words briefs. Both endpoints use the same shared-secret check as /score.
+#   POST /agent/tick   called every minute by pg_cron
+#   POST /agent/panic  called by an AFTER INSERT trigger on alerts (type = panic).
+#                      The existing alert/SMS flow is untouched and never waits on this.
+# -----------------------------------------------------------------------
+import logging
+import time as _time
+from concurrent.futures import ThreadPoolExecutor
+
+from agent.engine import Engine
+from agent.llm import LLMClient
+from agent.services import find_nearby_services
+from agent.store import AgentStore
+
+_AGENT_POOL = ThreadPoolExecutor(max_workers=2)
+_AGENT = None
+_AGENT_GUARD = threading.Lock()
+_TICK_LOCK = threading.Lock()
+
+
+def _agent_submit(fn, *args, **kwargs):
+    def run():
+        try:
+            fn(*args, **kwargs)
+        except Exception:  # noqa: BLE001
+            logging.getLogger("agent").exception("background agent task failed")
+    _AGENT_POOL.submit(run)
+
+
+def _agent():
+    global _AGENT
+    with _AGENT_GUARD:
+        if _AGENT is None:
+            if not os.environ.get("SUPABASE_URL"):
+                raise HTTPException(status_code=503, detail="agent requires SUPABASE_URL")
+            _AGENT = Engine(AgentStore(), LLMClient(), find_nearby_services, _time.time, submit=_agent_submit)
+        return _AGENT
+
+
+@app.post("/agent/tick")
+def agent_tick(x_webhook_secret: Optional[str] = Header(None)):
+    _check_webhook_secret(x_webhook_secret)
+    if not _TICK_LOCK.acquire(blocking=False):
+        return {"skipped": "tick_in_progress"}
+    try:
+        return _agent().tick()
+    finally:
+        _TICK_LOCK.release()
+
+
+@app.post("/agent/panic")
+def agent_panic(payload: dict, x_webhook_secret: Optional[str] = Header(None)):
+    _check_webhook_secret(x_webhook_secret)
+    alert_id = payload.get("alert_id") or (payload.get("record") or {}).get("id")
+    if not alert_id:
+        raise HTTPException(status_code=422, detail="alert_id required")
+    return _agent().handle_panic(str(alert_id))
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
