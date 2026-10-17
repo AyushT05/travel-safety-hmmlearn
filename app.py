@@ -61,8 +61,9 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Union
 
+import httpx
 import pymupdf
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
@@ -74,10 +75,26 @@ app = FastAPI()
 
 # Loaded once, at import time, when the Render process boots. Every request
 # afterward reuses this same object; nothing here is retrained per request.
-with open("model.pkl", "rb") as f:
-    MODEL = pickle.load(f)
-with open("durations.pkl", "rb") as f:
-    FITTED_DURATIONS = pickle.load(f)
+def _load_or_train():
+    """Load model.pkl/durations.pkl; retrain in-process if they are missing,
+    unreadable (numpy/hmmlearn version drift on the host), or were trained
+    under a different feature definition than the code now computes."""
+    from features import FEATURE_VERSION
+    try:
+        with open("model.pkl", "rb") as f:
+            model = pickle.load(f)
+        with open("durations.pkl", "rb") as f:
+            fitted = pickle.load(f)
+        if getattr(model, "feature_version", None) == FEATURE_VERSION:
+            return model, fitted
+        print("model.pkl feature_version mismatch; retraining in-process")
+    except Exception as exc:  # noqa: BLE001
+        print(f"could not load pickles ({exc!r}); retraining in-process")
+    from train_and_save import train_models
+    return train_models()
+
+
+MODEL, FITTED_DURATIONS = _load_or_train()
 
 # Falls back to in-memory storage if Supabase env vars aren't set, so this
 # is runnable locally without any credentials. Production MUST set
@@ -139,7 +156,7 @@ def _to_epoch_seconds(iso_timestamp: str) -> float:
 
 
 class LocationRecord(BaseModel):
-    id: Optional[int] = None
+    id: Optional[Union[int, str]] = None
     user_id: str
     travel_card_id: Optional[str] = None
     lat: float
@@ -217,23 +234,28 @@ def score(payload: SupabaseWebhookPayload, x_webhook_secret: Optional[str] = Hea
             if state is None:
                 state = initial_state()
 
-            # Webhook delivery can be concurrent or out of order. Location IDs
-            # are monotonically increasing, so ignore duplicate/older events.
+            # Webhook delivery can be concurrent or out of order. Skip a ping only
+            # if it is provably older: its id is not newer AND its timestamp is
+            # not newer. Requiring both matters: if the locations table is ever
+            # truncated/reset (ids restart at 1) the id check alone would
+            # silently freeze this trip's activity state forever.
             last_id = state.get("last_location_id")
             last_t = state.get("last_ping_t")
-            if location_id is not None and last_id is not None and location_id <= last_id:
+            id_not_newer = (isinstance(location_id, int) and isinstance(last_id, int)
+                            and location_id <= last_id)
+            t_not_newer = last_t is not None and t <= last_t
+            if (id_not_newer and t_not_newer) or (location_id is None and t_not_newer):
                 return {"trip_id": trip_id, "skipped": True, "reason": "duplicate_or_out_of_order", "location_id": location_id}
-            if location_id is None and last_t is not None and t <= last_t:
-                return {"trip_id": trip_id, "skipped": True, "reason": "duplicate_or_out_of_order"}
 
             new_state, result = process_ping(
                 state,
-                {"t": t, "lat": payload.record.lat, "lon": payload.record.lon},
+                {"t": t, "lat": payload.record.lat, "lon": payload.record.lon,
+                 "speed": payload.record.speed, "accuracy": payload.record.accuracy},
                 MODEL,
                 FITTED_DURATIONS,
             )
             new_state["last_ping_t"] = t
-            if location_id is not None:
+            if isinstance(location_id, int):
                 new_state["last_location_id"] = location_id
 
             if isinstance(STORE, SupabaseStateStore):

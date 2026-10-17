@@ -45,7 +45,16 @@ SPEED_PARAMS = {
     "STATIONARY_ANOMALOUS": (0.0, 0.05),  # looks like RESTING kinematically
 }
 
-GPS_NOISE_STD_M = 4.0  # typical consumer GPS jitter
+# Realistic phone GPS error model. The previous version added INDEPENDENT 4 m
+# noise to every fix, which makes a stationary phone look like it moves at
+# ~1.4 m/s when speed is computed by differencing positions (the same speed as
+# a slow walk). Real fused-provider error is strongly time-correlated, and
+# quality varies by environment (open sky vs indoors), so each trip draws its
+# own error scale and correlation time.
+GPS_NOISE_STD_RANGE_M = (2.0, 9.0)     # per-trip error scale
+GPS_NOISE_TAU_RANGE_S = (8.0, 30.0)    # per-trip error correlation time
+DOPPLER_SPEED_NOISE = 0.15             # m/s, reported-speed noise while moving
+DOPPLER_REST_NOISE = 0.08              # m/s, reported-speed noise while still
 
 
 def _meters_to_latlon_delta(dx_m, dy_m, lat0):
@@ -55,13 +64,20 @@ def _meters_to_latlon_delta(dx_m, dy_m, lat0):
     return dlat, dlon
 
 
-def _generate_segment(state, lat0, lon0, t0, rng, force_duration_sec=None):
+def _generate_segment(state, lat0, lon0, t0, rng, force_duration_sec=None, noise=None):
     lo, hi = DURATION_RANGES_SEC[state]
     duration_sec = force_duration_sec or rng.integers(lo, hi)
     n_samples = max(2, duration_sec // SAMPLE_INTERVAL_SEC)
 
     speed_mean, speed_std = SPEED_PARAMS[state]
+    if state == "WALKING":
+        speed_mean *= rng.uniform(0.6, 1.3)       # stroll .. brisk
+    elif state == "IN_VEHICLE":
+        speed_mean *= rng.uniform(0.35, 1.3)      # crawling traffic .. free flow
     heading = rng.uniform(0, 2 * np.pi)
+
+    if noise is None:
+        noise = _new_noise(rng)
 
     points = []
     lat, lon = lat0, lon0
@@ -80,23 +96,40 @@ def _generate_segment(state, lat0, lon0, t0, rng, force_duration_sec=None):
         lat += dlat
         lon += dlon
 
-        # GPS noise
-        noise_lat, noise_lon = _meters_to_latlon_delta(
-            rng.normal(0, GPS_NOISE_STD_M), rng.normal(0, GPS_NOISE_STD_M), lat
-        )
+        # Time-correlated GPS error (AR(1)), carried across segments so a
+        # trip's error does not reset at every activity change.
+        a = noise["a"]
+        noise["ex"] = a * noise["ex"] + np.sqrt(1 - a * a) * rng.normal(0, noise["sigma"])
+        noise["ey"] = a * noise["ey"] + np.sqrt(1 - a * a) * rng.normal(0, noise["sigma"])
+        noise_lat, noise_lon = _meters_to_latlon_delta(noise["ex"], noise["ey"], lat)
         obs_lat, obs_lon = lat + noise_lat, lon + noise_lon
+
+        # Doppler-style reported speed (what expo-location's coords.speed is)
+        if speed_mean > 0:
+            rep_speed = max(0.0, speed + rng.normal(0, DOPPLER_SPEED_NOISE))
+        else:
+            rep_speed = abs(rng.normal(0, DOPPLER_REST_NOISE))
+        accuracy = float(np.clip(noise["sigma"] * rng.uniform(1.0, 2.0), 3.0, 60.0))
 
         points.append(
             {
                 "t": t,
                 "lat": obs_lat,
                 "lon": obs_lon,
+                "speed": rep_speed,
+                "accuracy": accuracy,
                 "true_state": state,
             }
         )
         t += SAMPLE_INTERVAL_SEC
 
     return points, lat, lon, t
+
+
+def _new_noise(rng):
+    sigma = rng.uniform(*GPS_NOISE_STD_RANGE_M)
+    tau = rng.uniform(*GPS_NOISE_TAU_RANGE_S)
+    return {"sigma": sigma, "a": float(np.exp(-SAMPLE_INTERVAL_SEC / tau)), "ex": 0.0, "ey": 0.0}
 
 
 def generate_trip(rng=None, n_segments=12, anomaly_prob=0.15, force_one_anomaly=False):
@@ -110,6 +143,7 @@ def generate_trip(rng=None, n_segments=12, anomaly_prob=0.15, force_one_anomaly=
 
     lat, lon, t = 25.578, 91.893, 0  # arbitrary Northeast-India-ish start (Shillong area)
     trip = []
+    noise = _new_noise(rng)
 
     placed_anomaly = False
     for i in range(n_segments):
@@ -124,7 +158,7 @@ def generate_trip(rng=None, n_segments=12, anomaly_prob=0.15, force_one_anomaly=
             else:
                 state = rng.choice(["WALKING", "RESTING", "IN_VEHICLE"], p=[0.5, 0.35, 0.15])
 
-        pts, lat, lon, t = _generate_segment(state, lat, lon, t, rng)
+        pts, lat, lon, t = _generate_segment(state, lat, lon, t, rng, noise=noise)
         trip.extend(pts)
 
     return trip

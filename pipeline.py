@@ -33,6 +33,13 @@ from fusion import hsmm_evidence_llr
 WINDOW_SEC = 60
 DECODE_BUFFER_WINDOWS = 8
 
+# If pings stop for longer than this (sharing stopped/restarted, phone offline),
+# the half-built window and the run-duration counter no longer describe a
+# continuous stretch of activity. Previously the first ping after a gap closed
+# a window whose speed was (distance across the gap) / (gap length), which
+# looks like "barely moving", and extended the previous RESTING run.
+GAP_RESET_SEC = 180
+
 
 def initial_state():
     """The state dict for a brand-new trip, before any pings arrive."""
@@ -50,7 +57,8 @@ def initial_state():
 def process_ping(state, ping, model, fitted_durations):
     """
     state: dict as produced by initial_state() / a previous call's return
-    ping: {"t": epoch_seconds, "lat": float, "lon": float}
+    ping: {"t": epoch_seconds, "lat": float, "lon": float,
+           "speed": m/s or None, "accuracy": m or None}   (speed/accuracy optional)
     model: a trained hsmm_model.ExpandedHSMM
     fitted_durations: output of duration_fit.fit_gamma_distributions()
 
@@ -58,6 +66,16 @@ def process_ping(state, ping, model, fitted_durations):
     and was scored) or None (still buffering, not enough time elapsed yet).
     """
     state = dict(state)  # don't mutate the caller's dict in place
+
+    buf = state["window_buffer"]
+    last_t = buf[-1]["t"] if buf else state.get("last_ping_t")
+    if last_t is not None and ping["t"] - last_t > GAP_RESET_SEC:
+        state["window_buffer"] = []
+        state["window_start_t"] = None
+        state["decode_buffer"] = []
+        state["current_state"] = None
+        state["run_windows"] = 0
+
     state["window_buffer"] = list(state["window_buffer"]) + [ping]
 
     if state["window_start_t"] is None:

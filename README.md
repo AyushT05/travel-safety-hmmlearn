@@ -47,23 +47,44 @@ python3 evaluate.py      # the actual precision/recall comparison
 
 ## Current evaluated result (seed=100 train / seed=200 test, 250 trips each)
 
+Synthetic data only. The simulator now models time-correlated GPS error, a
+per-trip error scale (open sky to indoors) and Doppler-style reported speed, so
+these numbers are NOT directly comparable with the earlier table (0.429
+precision), which was measured on the older i.i.d.-noise simulator.
+
 | detector | precision | recall | median detection delay |
 |---|---|---|---|
-| naive fixed-threshold (35 min) | 0.146 | 1.000 | 35 min |
-| HSMM duration-tail (cutoff 0.05) | 0.429 | 0.971 | 64 min |
+| naive fixed-threshold (35 min) | 0.228 | 1.000 | 35 min |
+| HSMM duration-tail (cutoff 0.05) | 0.550 | 0.957 | 64 min |
 
-The HSMM approach roughly triples precision by not flagging ordinary long
-rests, at the cost of firing later. This is a real tradeoff, not a free
-win — say so plainly if asked. The tail-probability cutoff is a tunable
-knob (see the sweep below); it also gives a natural way to drive graduated
-escalation stages directly from one number instead of separate hand-picked
-thresholds per stage:
+The HSMM approach is more than twice as precise by not flagging ordinary long
+rests, at the cost of firing later. This is a real tradeoff, not a free win,
+say so plainly if asked. The cutoff is a tunable knob and can drive graduated
+escalation stages from one number:
 
 | cutoff | precision | recall | median delay |
 |---|---|---|---|
-| 0.25 (→ WATCH stage) | 0.164 | 1.000 | 39 min |
-| 0.10 (→ CONCERN stage) | 0.284 | 0.971 | 54 min |
-| 0.05 (→ CRITICAL stage) | 0.429 | 0.971 | 64 min |
+| 0.25 (WATCH stage) | 0.261 | 1.000 | 39 min |
+| 0.10 (CONCERN stage) | 0.433 | 0.978 | 54 min |
+| 0.05 (CRITICAL stage) | 0.550 | 0.957 | 64 min |
+
+## Activity classification robustness
+
+`features.py` now prefers the device's reported (Doppler) speed over speeds
+differenced from positions, and drops fixes with accuracy worse than 50 m.
+On an independently written GPS generator (30 simulated 15 min trips per
+case, first 3 minutes excluded), per-window accuracy of the macro state:
+
+| case | before | after |
+|---|---|---|
+| resting, very poor GPS (sigma 12 m, tau 5 s) | 2.5% | 100% |
+| every other case tried (walk / rest / drive, clean and poor GPS) | 97% to 100% | 100% |
+
+Caveat: the generator's reported speed is idealized (rest ~0.08 m/s noise).
+Real Android fused-provider speed can be noisier; if resting shows up as
+walking on a real phone, widen DOPPLER_REST_NOISE in simulator.py and retrain.
+`model.pkl` is tagged with `FEATURE_VERSION`; `app.py` retrains in-process if the
+pickle is missing, unreadable, or from a different feature version.
 
 ## Honest framing for a viva
 
