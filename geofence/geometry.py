@@ -149,3 +149,46 @@ def distance_to_geometry(lat, lon, geom):
         raise GeometryError("empty geometry")
     nlat, nlon = _lonlat(best[1], best[2], lat, lon)
     return best[0], nlat, nlon
+
+
+def signed_distance_to_geometry(lat, lon, geom):
+    """-> (signed_m, nearest_lat, nearest_lon).
+
+    Positive: metres to the geometry. Negative: the point is INSIDE a polygon, and the magnitude is how
+    deep (distance to the nearest edge). distance_to_geometry() returns 0 everywhere inside a polygon,
+    which cannot tell "well inside" from "on the edge"; accuracy-aware decisions need the depth.
+    """
+    best = None                      # (signed, x, y)
+
+    def consider(signed, x, y):
+        nonlocal best
+        if best is None or signed < best[0]:
+            best = (signed, x, y)
+
+    for kind, data in _parts(geom):
+        if kind == "point":
+            x, y = _xy(data[0], data[1], lat, lon)
+            consider(math.hypot(x, y), x, y)
+        elif kind == "line":
+            xy = [_xy(p[0], p[1], lat, lon) for p in data]
+            if len(xy) == 1:
+                consider(math.hypot(*xy[0]), *xy[0])
+            for a, b in zip(xy, xy[1:]):
+                d, x, y = _seg(0.0, 0.0, a[0], a[1], b[0], b[1])
+                consider(d, x, y)
+        else:
+            rings = [[_xy(p[0], p[1], lat, lon) for p in r] for r in data]
+            edge = None
+            for ring in rings:
+                for a, b in zip(ring, ring[1:] + ring[:1]):
+                    d, x, y = _seg(0.0, 0.0, a[0], a[1], b[0], b[1])
+                    if edge is None or d < edge[0]:
+                        edge = (d, x, y)
+            if edge is None:
+                continue
+            inside = bool(rings) and _ring_contains(0.0, 0.0, rings[0]) and not any(_ring_contains(0.0, 0.0, h) for h in rings[1:])
+            consider(-edge[0] if inside else edge[0], edge[1], edge[2])
+    if best is None:
+        raise GeometryError("empty geometry")
+    nlat, nlon = _lonlat(best[1], best[2], lat, lon)
+    return best[0], nlat, nlon

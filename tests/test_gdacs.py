@@ -159,4 +159,7 @@ def test_store_expire_and_bbox_queries():
     s.zones_in_bbox(12.0, 76.0, 13.0, 77.0, "2026-10-24T00:00:00+00:00")
     p = seen[-1].url.params
     assert p["min_lat"] == "lte.13.0" and p["max_lat"] == "gte.12.0" and p["min_lon"] == "lte.77.0" and p["max_lon"] == "gte.76.0"
-    assert "expires_at.is.null" in p["or"]
+    assert p["and"] == "(or(expires_at.is.null,expires_at.gt.2026-10-24T00:00:00+00:00))"
+    s.zones_in_bbox(12.0, 76.0, 13.0, 77.0, "2026-10-24T00:00:00+00:00", gdacs_fresh_after_iso="2026-10-23T12:00:00+00:00")
+    assert seen[-1].url.params["and"] == ("(or(expires_at.is.null,expires_at.gt.2026-10-24T00:00:00+00:00),"
+                                          "or(source.neq.GDACS,updated_at.gt.2026-10-23T12:00:00+00:00))")

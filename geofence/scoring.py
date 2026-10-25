@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-from .geometry import GeometryError, angle_diff, bearing_deg, distance_to_geometry, geometry_kind
+from .geometry import GeometryError, angle_diff, bearing_deg, distance_to_geometry, geometry_kind, signed_distance_to_geometry
 from .sun import is_dark, sun_times, local_solar_date
 from .zones import Zone, aware
 
@@ -121,6 +121,8 @@ def freshness(zone: Zone, t: datetime):
     if zone.status != "active":
         return None, "inactive"
     t = aware(t)
+    if zone.valid_from is not None and t < aware(zone.valid_from):
+        return None, "not_yet_valid"
     if zone.expires_at is not None:
         return (None, "expired_before_arrival") if t > aware(zone.expires_at) else (1.0, None)
     prof = PROFILES[zone.hazard_type]
@@ -134,10 +136,13 @@ def freshness(zone: Zone, t: datetime):
 
 
 def zone_proximity(sample: Sample, zone: Zone, prev: Optional[Sample] = None) -> Proximity:
-    dist, nlat, nlon = distance_to_geometry(sample.lat, sample.lon, zone.geometry)
+    signed, nlat, nlon = signed_distance_to_geometry(sample.lat, sample.lon, zone.geometry)
+    dist = max(0.0, signed)                              # metres to the geometry, 0 inside a polygon
     buf = zone.radius_m if zone.radius_m is not None else DEFAULT_BUFFER_M[geometry_kind(zone.geometry)]
     acc = DEFAULT_ACCURACY_M if sample.accuracy_m is None else max(0.0, sample.accuracy_m)
-    gap = dist - buf                                     # negative: inside the buffered zone
+    # Negative gap: inside the buffered zone. For polygons the SIGNED distance carries the depth, so a
+    # position deep inside is "inside" and one within the accuracy circle of the edge is "uncertain".
+    gap = signed - buf
     speed = sample.speed_mps or 0.0
     warn = WARN_BASE_M.get(zone.severity, 200.0) + speed * LEAD_TIME_S
     bearing = bearing_deg(sample.lat, sample.lon, nlat, nlon) if dist > 0 else None

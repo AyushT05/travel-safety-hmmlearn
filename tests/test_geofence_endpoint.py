@@ -1,7 +1,13 @@
 import pytest
-from fastapi.testclient import TestClient
 
-import app as service
+# These tests import the whole service, which needs the full runtime stack from requirements.txt.
+# Without it they are skipped (not a collection error), so the pure geofence tests still run.
+for _mod in ("fastapi", "httpx", "hmmlearn", "pymupdf"):
+    pytest.importorskip(_mod)
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+import app as service  # noqa: E402
 
 
 @pytest.fixture

@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from geofence.geometry import angle_diff, bbox_of, bearing_deg, distance_to_geometry, haversine_m
+from geofence.geometry import angle_diff, bbox_of, bearing_deg, distance_to_geometry, haversine_m, signed_distance_to_geometry
 from geofence.route import assess_route, densify
 from geofence.scoring import Sample, assess_point, freshness, zone_proximity
 from geofence.state import transition
@@ -240,3 +240,35 @@ def test_entry_right_after_approach_is_not_suppressed_but_reentry_is():
     d = transition(row, "inside", now + 30)                                          # re-entry inside 5 min
     assert d.emit is None and d.reason == "entry suppressed by cooldown"
     assert transition(d.row, "outside", now + 40).emit is None
+
+
+# ---------------------------------------------------------------- polygon depth (regression: found with real GDACS polygons)
+SQUARE = {"type": "Polygon", "coordinates": [[[LON - .01, LAT - .01], [LON + .01, LAT - .01], [LON + .01, LAT + .01],
+                                              [LON - .01, LAT + .01], [LON - .01, LAT - .01]]]}      # about 2.2 km wide
+
+
+def test_signed_distance_is_negative_depth_inside_and_positive_outside():
+    centre, _, _ = signed_distance_to_geometry(LAT, LON, SQUARE)
+    assert centre == pytest.approx(-1086, abs=10)                     # half the width (0.01 deg of longitude here)
+    near_edge, _, _ = signed_distance_to_geometry(LAT, LON + .01 - 20 / 108642, SQUARE)
+    assert -30 < near_edge < -10
+    outside, _, _ = signed_distance_to_geometry(LAT, LON + .01 + 100 / 108642, SQUARE)
+    assert outside == pytest.approx(100, abs=5)
+    line, _, _ = signed_distance_to_geometry(LAT, LON, {"type": "LineString", "coordinates": [[LON, LAT + .001], [LON + .01, LAT + .001]]})
+    assert line > 0
+
+
+def test_polygon_zones_are_inside_when_deep_and_uncertain_only_near_the_edge():
+    z = zone("flood", radius=None, geom=SQUARE)
+    assert zone_proximity(at(0, accuracy_m=10), z).state == "inside"                 # was "uncertain_boundary" before the fix
+    edge = Sample(LAT, LON + .01 - 20 / 108642, NIGHT, accuracy_m=50)
+    assert zone_proximity(edge, z).state == "uncertain_boundary"
+    out = Sample(LAT, LON + .01 + 150 / 108642, NIGHT, accuracy_m=5)          # 150 m outside, inside the 200 m warning distance
+    assert zone_proximity(out, z).state == "near"
+    assert zone_proximity(Sample(LAT, LON + 1.0, NIGHT, accuracy_m=5), z).state == "outside"
+
+
+def test_buffer_deepens_a_polygon_zone():
+    z = zone("flood", radius=300, geom=SQUARE)
+    outside = Sample(LAT, LON + .01 + 100 / 108642, NIGHT, accuracy_m=5)            # 100 m outside, inside the 300 m buffer
+    assert zone_proximity(outside, z).state == "inside"

@@ -33,12 +33,19 @@ class RiskZoneStore:
                             headers={**self.h, "Prefer": "return=minimal"}, json={"status": "expired"})
         r.raise_for_status()
 
-    def zones_in_bbox(self, min_lat, min_lon, max_lat, max_lon, now_iso):
+    def zones_in_bbox(self, min_lat, min_lon, max_lat, max_lon, now_iso, gdacs_fresh_after_iso=None):
         """Active, unexpired zones whose bounding box overlaps the box. Callers pad the box by the
-        largest buffer they care about, since radius_m is applied after this pre-filter."""
+        largest buffer they care about, since radius_m is applied after this pre-filter.
+
+        gdacs_fresh_after_iso is the dead-man switch for ingested disaster zones: a GDACS row that the
+        hourly sync has not touched since then is ignored, so a stopped sync cannot leave a stale
+        forecast alive for days. (Each upsert refreshes updated_at via the table trigger.)"""
+        conds = [f"or(expires_at.is.null,expires_at.gt.{now_iso})"]
+        if gdacs_fresh_after_iso:
+            conds.append(f"or(source.neq.GDACS,updated_at.gt.{gdacs_fresh_after_iso})")
         r = self.http.get(f"{self.base}/risk_zones", headers=self.h, params=[
             ("status", "eq.active"), ("min_lat", f"lte.{max_lat}"), ("max_lat", f"gte.{min_lat}"),
             ("min_lon", f"lte.{max_lon}"), ("max_lon", f"gte.{min_lon}"),
-            ("or", f"(expires_at.is.null,expires_at.gt.{now_iso})"), ("select", "*")])
+            ("and", "(" + ",".join(conds) + ")"), ("select", "*")])
         r.raise_for_status()
         return r.json()

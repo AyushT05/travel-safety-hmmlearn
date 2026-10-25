@@ -65,7 +65,16 @@ Deploy order:
 Behaviour to remember:
 - Only GDACS events with iscurrent = "true" inside the India-plus-margin box are stored. Override the box
   with env `GEOFENCE_INTEREST_BBOX="min_lat,min_lon,max_lat,max_lon"`.
-- Zones are approximate discs (confidence 0.4) until real footprints from `properties.url.geometry` are used.
-- Each zone lives 6 hours from the last successful sync; earthquakes 72 hours from the event.
+- Cyclones use real wind-field polygons from `properties.url.geometry` (one zone per time step and wind band:
+  60 km/h medium, 90 high, 120 critical). Each is valid from the previous step to the next, so a moving storm
+  leaves no gap, and `Zone.valid_from` keeps a forecast field from applying before its time. Forecast
+  confidence falls 0.1 per day ahead (floor 0.4). Used from the geometry response: only features with
+  featuretype WindRadii. Ignored on purpose: the cumulative whole-storm swaths, the uncertainty cone, track
+  lines, point circles, and degenerate zero-area polygons.
+- If the geometry call fails the cyclone keeps its approximate disc (confidence 0.4); if it succeeds but holds
+  no wind-field area the event is dropped. Floods, earthquakes and wildfires are still approximate discs.
+- Discs live 6 hours from the last sync; wind fields until the end of their validity window; earthquakes 72 hours.
+  `RiskZoneStore.zones_in_bbox(..., gdacs_fresh_after_iso=...)` ignores GDACS rows not refreshed recently, so a
+  stopped sync cannot keep a stale forecast alive.
 - A failed or empty GDACS response raises before any write: it never retires live hazards.
 - Nothing in the live scoring or alert path calls the geofence evaluator yet (step 5 is not wired).

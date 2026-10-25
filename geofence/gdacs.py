@@ -9,6 +9,18 @@ What the real feed taught us (checked on 86 events, 17 months of history):
   * Severity units differ per type (EQ magnitude, TC km/h, WF hectares) and floods carry no severity (0).
     So severity here comes from the GDACS alert level, not from the number.
   * Timestamps have no timezone; GDACS publishes UTC.
+
+What the real cyclone geometry response taught us (event 1001338, 112 features, 470 KB):
+  * It mixes hazard footprints with things that only LOOK like footprints. Used: the per-time-step
+    wind fields (featuretype "WindRadii", classes Poly_Green/Orange/Red = winds of 60/90/120 km/h).
+    NOT used: the cumulative "whole storm life" swaths (a 3.5 million km2 Green polygon covering the
+    past track), the forecast uncertainty cone (track uncertainty, not wind), track lines, and the
+    tiny per-fix point circles.
+  * Later forecast steps can be degenerate (every vertex identical, area 0) once the storm weakens.
+    Those carry no area and are skipped.
+  * A wind field is a snapshot at a time, so each one becomes a zone with a validity window.
+  * Only cyclones get footprints so far. Floods, earthquakes and wildfires stay approximate discs
+    until their geometry responses have been seen.
 """
 from datetime import datetime, timedelta, timezone
 
@@ -98,6 +110,7 @@ def feature_to_row(feat, now, bbox=DEFAULT_INTEREST_BBOX):
             "episode_id": p.get("episodeid"), "alert_level": level, "alert_score": p.get("alertscore"),
             "severity_value": sev_val, "severity_text": sev.get("severitytext"), "country": p.get("country"),
             "from": p.get("fromdate"), "to": p.get("todate"), "glide": p.get("glide") or None,
+            "geometry_url": (p.get("url") or {}).get("geometry"),
         },
     }
     return row, None
@@ -127,3 +140,116 @@ def refs_to_expire(existing_active_refs, rows):
     """GDACS zones we stored earlier that the feed no longer lists as current."""
     keep = {r["source_ref"] for r in rows}
     return sorted(r for r in existing_active_refs if r.startswith(PREFIX) and r not in keep)
+
+
+# ---------------------------------------------------------------------------------- cyclone footprints
+BANDS = {"Poly_Red": ("critical", 120), "Poly_Orange": ("high", 90), "Poly_Green": ("medium", 60)}
+MIN_AREA_KM2 = 1.0                       # below this a polygon is a degenerate point, not a wind field
+HORIZON = timedelta(hours=96)            # forecast steps further ahead than this are not stored
+EDGE_PADDING = timedelta(hours=12)       # validity added before the first and after the last step
+ANALYSIS_CONFIDENCE = 0.7                # wind field for a time that has already happened
+FORECAST_CONFIDENCE_FLOOR = 0.4          # forecast confidence falls by 0.1 per day ahead, down to this
+
+
+def polygon_area_km2(rings):
+    """Approximate area of a GeoJSON polygon (outer ring minus holes), in km2."""
+    import math
+
+    def one(ring):
+        lat0 = sum(c[1] for c in ring) / len(ring)
+        k = 111.195
+        pts = [(c[0] * k * math.cos(math.radians(lat0)), c[1] * k) for c in ring]
+        a = sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1]))
+        return abs(a) / 2.0
+    if not rings or not rings[0]:
+        return 0.0
+    return max(0.0, one(rings[0]) - sum(one(h) for h in rings[1:] if h))
+
+
+def _footprint_confidence(step_t, now):
+    if step_t <= now:
+        return ANALYSIS_CONFIDENCE
+    days = (step_t - now).total_seconds() / 86400.0
+    return round(max(FORECAST_CONFIDENCE_FLOOR, 0.65 - 0.1 * days), 2)
+
+
+def tc_footprint_rows(parent, fc, now):
+    """Wind-field polygons of one cyclone -> risk_zones rows, one per (time step, wind band).
+
+    Each wind field is valid from the previous step to the next step. Overlapping windows mean that,
+    at any moment, the fields on both sides of "now" apply, which covers the area swept while the
+    storm moves between snapshots instead of leaving gaps.
+    Returns [] when the response is valid but holds no wind-field area (a dissipated storm).
+    Raises ValueError when the response is not a usable geometry feed.
+    """
+    from .geometry import GeometryError, bbox_of
+
+    feats = fc.get("features") if isinstance(fc, dict) else None
+    if not isinstance(feats, list):
+        raise ValueError("GDACS geometry response has no features list")
+    steps = {}
+    for f in feats:
+        p, g = f.get("properties") or {}, f.get("geometry") or {}
+        if p.get("featuretype") != "WindRadii" or p.get("Class") not in BANDS:
+            continue
+        if str(p.get("visible")).lower() == "false" or g.get("type") != "Polygon":
+            continue
+        t = _dt(p.get("polygondate"))
+        if t is not None:
+            steps.setdefault(t, {})[p["Class"]] = g
+    times = sorted(steps)
+    rows = []
+    for i, t in enumerate(times):
+        start = times[i - 1] if i > 0 else t - EDGE_PADDING
+        end = times[i + 1] if i < len(times) - 1 else t + EDGE_PADDING
+        if end <= now or start > now + HORIZON:
+            continue
+        for cls, (sev, kmh) in BANDS.items():
+            g = steps[t].get(cls)
+            if not g or polygon_area_km2(g.get("coordinates")) < MIN_AREA_KM2:
+                continue
+            try:
+                bbox_of(g)
+            except GeometryError:
+                continue
+            attrs = {**parent["attributes"], "footprint": "wind_radii", "band_kmh": kmh,
+                     "step_time": t.isoformat(), "valid_from": start.isoformat(), "valid_until": end.isoformat(),
+                     "forecast": t > now}
+            rows.append({
+                "name": f"{parent['name']}: winds >= {kmh} km/h at {t:%d %b %H:%M} UTC"[:200],
+                "hazard_type": "cyclone", "geometry": g, "radius_m": 0, "severity": sev,
+                "confidence": _footprint_confidence(t, now), "source": SOURCE, "source_url": parent["source_url"],
+                "source_ref": f"{parent['source_ref']}:{t:%Y%m%d%H%M}:{kmh}",
+                "observed_at": now.isoformat(), "expires_at": end.isoformat(), "status": "active",
+                "attributes": attrs,
+            })
+    return rows
+
+
+def enrich_with_footprints(rows, fetch, now):
+    """Replace each cyclone's approximate disc with real wind fields where the geometry is available.
+
+    * geometry fetched, wind fields found  -> the disc is replaced by the polygons
+    * geometry fetched, no wind-field area -> the event is dropped (a dissipated storm is not a hazard)
+    * geometry could not be fetched/parsed -> the disc is KEPT, so an outage never hides a cyclone
+    """
+    out = []
+    report = {"footprint_rows": 0, "fallback_discs": 0, "dropped_no_wind_field": 0, "errors": []}
+    for r in rows:
+        url = (r.get("attributes") or {}).get("geometry_url")
+        if (r.get("attributes") or {}).get("event_type") != "TC" or not url:
+            out.append(r)
+            continue
+        try:
+            fp = tc_footprint_rows(r, fetch(url), now)
+        except Exception as e:  # noqa: BLE001
+            out.append(r)
+            report["fallback_discs"] += 1
+            report["errors"].append(f"{r['source_ref']}: {type(e).__name__}")
+            continue
+        if fp:
+            out.extend(fp)
+            report["footprint_rows"] += len(fp)
+        else:
+            report["dropped_no_wind_field"] += 1
+    return out, report

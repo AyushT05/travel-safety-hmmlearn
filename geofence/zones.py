@@ -36,6 +36,7 @@ class Zone:
     status: str = "active"
     source_url: Optional[str] = None
     attributes: dict = field(default_factory=dict)
+    valid_from: Optional[datetime] = None   # hazard not in effect before this (e.g. a forecast wind field)
 
 
 def zone_from_risk_row(r):
@@ -47,6 +48,7 @@ def zone_from_risk_row(r):
         observed_at=parse_dt(r.get("observed_at")), expires_at=parse_dt(r.get("expires_at")),
         status=r.get("status") or "active", source_url=r.get("source_url"),
         attributes=r.get("attributes") or {},
+        valid_from=parse_dt((r.get("attributes") or {}).get("valid_from")),
     )
 
 
