@@ -238,6 +238,33 @@ def agent_panic(payload: dict, x_webhook_secret: Optional[str] = Header(None)):
     return _agent().handle_panic(str(alert_id))
 
 
+# -----------------------------------------------------------------------
+# Dynamic geo-fencing (see geofence/). Hazard zones live in Supabase risk_zones.
+#   POST /geofence/sync/gdacs   called hourly by pg_cron; pulls current GDACS disaster events.
+# A failed fetch raises before anything is written, so live hazards are never retired by an outage.
+# -----------------------------------------------------------------------
+from geofence.store import RiskZoneStore
+from geofence.sync import sync_gdacs
+
+_GDACS_LOCK = threading.Lock()
+
+
+@app.post("/geofence/sync/gdacs")
+def geofence_sync_gdacs(x_webhook_secret: Optional[str] = Header(None)):
+    _check_webhook_secret(x_webhook_secret)
+    if not os.environ.get("SUPABASE_URL"):
+        raise HTTPException(status_code=503, detail="geofence sync requires SUPABASE_URL")
+    if not _GDACS_LOCK.acquire(blocking=False):
+        return {"skipped": "sync_in_progress"}
+    try:
+        return sync_gdacs(RiskZoneStore())
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("geofence").exception("gdacs sync failed")
+        raise HTTPException(status_code=502, detail=f"GDACS sync failed: {type(e).__name__}")
+    finally:
+        _GDACS_LOCK.release()
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}

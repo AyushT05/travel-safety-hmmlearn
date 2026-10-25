@@ -47,3 +47,25 @@ This branch contains the backend/migration portion of three changes:
 ## Security note
 
 A webhook secret was pasted in the earlier SQL in the conversation. Treat it as compromised and rotate it: update Render's `WEBHOOK_SECRET` and the secret used by the Supabase trigger together. Do not commit the real value into source control.
+
+## Dynamic geo-fencing (steps 1 to 3, plus GDACS ingestion)
+
+Code: `geofence/` (pure scoring, route sampling, alert state machine, GDACS parser, Supabase store).
+Tests: `tests/test_geofence.py`, `tests/test_gdacs.py`, `tests/test_geofence_endpoint.py`
+(fixture `tests/fixtures/gdacs_list_sample.json` is trimmed from a real GDACS list response).
+
+Deploy order:
+1. Main repo, Supabase SQL editor: `20261024_risk_zones_and_geofence_state.sql`, then
+   `20261025_risk_zones_upsert_fix.sql` (the first created a partial unique index that breaks upserts).
+2. Deploy this service (adds `POST /geofence/sync/gdacs`, protected by the same X-Webhook-Secret).
+3. Trigger once by hand: `curl.exe -X POST https://travel-safety-hmmlearn.onrender.com/geofence/sync/gdacs -H "x-webhook-secret: <WEBHOOK_SECRET>"`
+   and check `select name, hazard_type, severity, radius_m, expires_at from risk_zones;`.
+4. Run `supabase_migrations/20261025_geofence_gdacs_cron.sql` (put the real secret in only in the SQL editor).
+
+Behaviour to remember:
+- Only GDACS events with iscurrent = "true" inside the India-plus-margin box are stored. Override the box
+  with env `GEOFENCE_INTEREST_BBOX="min_lat,min_lon,max_lat,max_lon"`.
+- Zones are approximate discs (confidence 0.4) until real footprints from `properties.url.geometry` are used.
+- Each zone lives 6 hours from the last successful sync; earthquakes 72 hours from the event.
+- A failed or empty GDACS response raises before any write: it never retires live hazards.
+- Nothing in the live scoring or alert path calls the geofence evaluator yet (step 5 is not wired).
