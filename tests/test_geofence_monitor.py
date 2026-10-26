@@ -261,3 +261,33 @@ def test_alert_insert_resolve_and_state_requests():
     body = __import__("json").loads(seen[-1].content)
     assert seen[-1].url.params["on_conflict"] == "user_id,zone_key" and body["last_entry_at"].startswith("2026-10-24T15:31")
     assert body["last_alert_id"] == 55 and body["last_level"] == "danger"
+
+
+# ------------------------------------------------------------------ regression: found on a real phone
+# A phone lying still near a hazard produced "Approaching" then cleared 16 s later: GPS jitter was read as walking.
+JITTER = [0, 6, -5, 6, -6, 5, -4, 6, -6, 4, -5, 6, -6, 5, -4, 6]
+
+
+@pytest.mark.parametrize("speed", [0.0, None, -1])
+def test_a_stationary_phone_near_a_hazard_never_alerts(speed):
+    mon, db, clock = make([zone()])                              # 100 m radius, high severity: warns within 400 m
+    for i, j in enumerate(JITTER * 2):
+        mon.handle_location(fix(clock, -300 + j, i + 1, acc=8.0, speed=speed))
+    assert db.alerts == [] and db.saved == []
+
+
+def test_walking_toward_a_hazard_without_a_heading_still_warns():
+    mon, db, clock = make([zone()])
+    types = []
+    for i in range(14):                                          # 1.4 m/s = 7 m per 5 s, starting 380 m away
+        types += [a["type"] for a in mon.handle_location(fix(clock, -380 + 7 * i, i + 1, acc=8.0, speed=1.4)).get("alerts", [])]
+    assert types == ["geofence_approach"]
+
+
+def test_walking_away_after_standing_inside_is_not_an_approach():
+    mon, db, clock = make([zone()])
+    mon.handle_location(fix(clock, 0, 1))                        # inside
+    types = []
+    for i in range(8):
+        types += [a["type"] for a in mon.handle_location(fix(clock, -60 * (i + 1), i + 2, speed=4.0)).get("alerts", [])]
+    assert "geofence_approach" not in types

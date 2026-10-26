@@ -25,6 +25,8 @@ LEAD_TIME_S = 30.0            # extra warning distance = speed * this
 DEFAULT_ACCURACY_M = 50.0     # used when the fix gives no accuracy: do not assume it is good
 APPROACH_ANGLE_DEG = 60.0
 MIN_MOVING_SPEED_MPS = 1.0
+CLOSING_MIN_M = 10.0          # distance to a zone must shrink by at least this (more with a poor fix) to count as approaching
+CLOSING_MAX_M = 30.0
 DEFAULT_BUFFER_M = {"point": 100.0, "line": 30.0, "polygon": 0.0}
 STALE_FLOOR = 0.05
 
@@ -157,8 +159,13 @@ def zone_proximity(sample: Sample, zone: Zone, prev: Optional[Sample] = None) ->
             if angle_diff(sample.heading_deg, bearing) <= APPROACH_ANGLE_DEG:
                 state = "approaching"
         elif prev is not None:
+            # No heading: infer approach from the distance shrinking since an earlier fix. A phone lying
+            # still still jitters by several metres, so (a) a phone that reports it is not moving never
+            # "approaches", and (b) the shrinkage must clearly exceed the fix's own uncertainty.
+            speed_known = sample.speed_mps is not None and sample.speed_mps >= 0
+            moving = (not speed_known) or sample.speed_mps >= MIN_MOVING_SPEED_MPS
             pd, _, _ = distance_to_geometry(prev.lat, prev.lon, zone.geometry)
-            if pd - dist > 5.0:                          # closing in by more than GPS noise
+            if moving and pd - dist > max(CLOSING_MIN_M, min(2 * acc, CLOSING_MAX_M)):
                 state = "approaching"
     else:
         state = "outside"

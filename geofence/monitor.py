@@ -17,13 +17,16 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
 
-from .scoring import Sample, assess_point
+from .scoring import CLOSING_MAX_M, CLOSING_MIN_M, Sample, assess_point
 from .state import transition
 from .zones import parse_dt
 
 log = logging.getLogger("geofence")
 
 LIVE_MAX_AGE_S = 120.0
+ANCHOR_MIN_AGE_S = 10.0        # "approaching" compares with a fix at least this old, never the previous 5 s one
+ANCHOR_MAX_AGE_S = 30.0
+UNKNOWN_SPEED_ANCHOR_S = 20.0
 MAX_FUTURE_SKEW_S = 300.0
 ALERT_NS = uuid.UUID("6f9619ff-8b86-d011-b42d-00cf4fc964ff")
 ALERT_TYPE = {"approach": "geofence_approach", "entry": "geofence_entry", "exit": "geofence_exit"}
@@ -40,7 +43,7 @@ class _User:
         self.lock = threading.Lock()
         self.states = {}
         self.loaded = False
-        self.prev = None
+        self.hist = []              # [(epoch, Sample)] of the last ANCHOR_MAX_AGE_S seconds
         self.last_t = None
 
 
@@ -81,8 +84,18 @@ class GeofenceMonitor:
             if not u.loaded:
                 u.states = self.db.load_states(uid)
                 u.loaded = True
-            sample = Sample(float(rec["lat"]), float(rec["lon"]), t, rec.get("accuracy"), None, rec.get("speed"))
-            prev, u.prev = u.prev, sample
+            speed = rec.get("speed")
+            speed = speed if isinstance(speed, (int, float)) and speed >= 0 else None     # -1 / null = unknown
+            sample = Sample(float(rec["lat"]), float(rec["lon"]), t, rec.get("accuracy"), None, speed)
+            # Baseline for "am I getting closer?": the NEWEST fix that is old enough for real walking to clearly
+            # exceed GPS noise at this speed and accuracy (the previous fix, 5 s ago, mistakes jitter for
+            # movement), yet recent enough that a path that turned around is not judged against where it started.
+            acc = sample.accuracy_m if sample.accuracy_m is not None else 50.0
+            need_m = max(CLOSING_MIN_M, min(2 * acc, CLOSING_MAX_M))
+            want_age = (UNKNOWN_SPEED_ANCHOR_S if not speed else
+                        min(ANCHOR_MAX_AGE_S, max(ANCHOR_MIN_AGE_S, 1.5 * need_m / speed)))
+            prev = next((smp for a, smp in reversed(u.hist) if ts - a >= want_age), None)
+            u.hist = [(a, smp) for a, smp in u.hist if ts - a <= ANCHOR_MAX_AGE_S] + [(ts, sample)]
             groups = {}
             for z in self.db.zones_near(sample.lat, sample.lon):
                 groups.setdefault(group_key(z), []).append(z)
