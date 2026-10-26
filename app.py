@@ -164,6 +164,10 @@ class LocationRecord(BaseModel):
     accuracy: Optional[float] = None
     speed: Optional[float] = None
     created_at: str
+    # The row's real observation time. created_at in the webhook is the server's now(), which is the
+    # wrong clock for deciding whether a fix is live (an offline backlog arrives all at once).
+    observed_at: Optional[str] = None
+    recorded_at: Optional[str] = None
 
 
 class SupabaseWebhookPayload(BaseModel):
@@ -248,6 +252,43 @@ from geofence.sync import sync_gdacs
 
 _GDACS_LOCK = threading.Lock()
 
+# Live geofence alerts: one location in, approach / entry / exit alerts out. Off unless GEOFENCE_ALERTS=on,
+# so deploying the code changes nothing until you opt in. Runs on a small thread pool; every failure is
+# logged and swallowed because HSMM scoring and SOS must never depend on it.
+from geofence.monitor import GeofenceMonitor
+from geofence.store import SupabaseGeofenceDb
+
+_GEOFENCE_POOL = ThreadPoolExecutor(max_workers=3)
+_GEOFENCE = None
+_GEOFENCE_GUARD = threading.Lock()
+
+
+def _geofence_enabled():
+    return os.environ.get("GEOFENCE_ALERTS", "").lower() in ("1", "true", "on", "yes") and bool(os.environ.get("SUPABASE_URL"))
+
+
+def _geofence_monitor():
+    global _GEOFENCE
+    with _GEOFENCE_GUARD:
+        if _GEOFENCE is None:
+            _GEOFENCE = GeofenceMonitor(SupabaseGeofenceDb())
+        return _GEOFENCE
+
+
+def _geofence_run(rec):
+    try:
+        _geofence_monitor().handle_location(rec)
+    except Exception:  # noqa: BLE001
+        logging.getLogger("geofence").exception("geofence evaluation failed")
+
+
+def _geofence_submit(rec):
+    try:
+        if _geofence_enabled():
+            _GEOFENCE_POOL.submit(_geofence_run, rec)
+    except Exception:  # noqa: BLE001
+        logging.getLogger("geofence").exception("geofence submit failed")
+
 
 @app.post("/geofence/sync/gdacs")
 def geofence_sync_gdacs(x_webhook_secret: Optional[str] = Header(None)):
@@ -309,6 +350,8 @@ def score(payload: SupabaseWebhookPayload, x_webhook_secret: Optional[str] = Hea
 
     if payload.type != "INSERT" or payload.table != "locations":
         return {"skipped": True, "reason": "unsupported webhook event"}
+
+    _geofence_submit(payload.record.model_dump())      # best effort, never blocks or breaks scoring
 
     trip_id = payload.record.travel_card_id or payload.record.user_id
     t = _to_epoch_seconds(payload.record.created_at)

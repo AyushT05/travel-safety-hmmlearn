@@ -111,6 +111,7 @@ def feature_to_row(feat, now, bbox=DEFAULT_INTEREST_BBOX):
             "severity_value": sev_val, "severity_text": sev.get("severitytext"), "country": p.get("country"),
             "from": p.get("fromdate"), "to": p.get("todate"), "glide": p.get("glide") or None,
             "geometry_url": (p.get("url") or {}).get("geometry"),
+            "event_ref": f"{PREFIX}{etype}:{p.get('eventid')}",   # all zones of one event share this: one alert, not one per band
         },
     }
     return row, None
