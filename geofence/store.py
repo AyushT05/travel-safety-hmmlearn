@@ -157,3 +157,66 @@ class SupabaseGeofenceDb(RiskZoneStore):
                             headers={**self.h, "Prefer": "return=minimal"},
                             json={"status": "resolved", "resolved_at": _iso(self.clock())})
         r.raise_for_status()
+
+    # ---- trip route cache for deviation monitoring
+    def get_trip_route(self, travel_card_id: str):
+        if not travel_card_id:
+            return None
+        now = self.clock()
+        if not hasattr(self, "_routes"):
+            self._routes = {}
+        hit = self._routes.get(travel_card_id)
+        if hit and now - hit[0] < 900.0:    # 15 min cache
+            return hit[1]
+
+        try:
+            r = self.http.get(
+                f"{self.base}/travel_cards",
+                headers=self.h,
+                params={"id": f"eq.{travel_card_id}", "select": "id,places,place_details,planned_route"},
+            )
+            r.raise_for_status()
+            rows = r.json()
+            if not rows:
+                return None
+            card = rows[0]
+            planned = card.get("planned_route")
+            if isinstance(planned, dict) and planned.get("polyline") and len(planned["polyline"]) >= 2:
+                self._routes[travel_card_id] = (now, planned)
+                return planned
+
+            # Extract waypoints from place_details
+            from .route import fetch_road_route
+            details = card.get("place_details") or []
+            pts = []
+            dest_name = "Destination"
+            for d in details:
+                if isinstance(d, dict) and d.get("lat") is not None and d.get("lon") is not None:
+                    pts.append((float(d["lat"]), float(d["lon"])))
+                    if d.get("name"):
+                        dest_name = d["name"]
+
+            if len(pts) >= 2:
+                route_res = fetch_road_route(pts, client=self.http)
+                route_dict = {
+                    "polyline": route_res["polyline"],
+                    "distance_m": route_res["distance_m"],
+                    "duration_s": route_res["duration_s"],
+                    "destination": dest_name,
+                    "source": route_res["source"],
+                }
+                self._routes[travel_card_id] = (now, route_dict)
+                # Save computed route back to travel card if possible (best-effort)
+                try:
+                    self.http.patch(
+                        f"{self.base}/travel_cards",
+                        headers={**self.h, "Prefer": "return=minimal"},
+                        params={"id": f"eq.{travel_card_id}"},
+                        json={"planned_route": route_dict},
+                    )
+                except Exception:
+                    pass
+                return route_dict
+        except Exception:
+            pass
+        return None

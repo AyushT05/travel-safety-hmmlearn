@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from .scoring import CLOSING_MAX_M, CLOSING_MIN_M, Sample, assess_point
 from .state import transition
 from .zones import parse_dt
+from .deviation import RouteDeviationTracker
 
 log = logging.getLogger("geofence")
 
@@ -50,6 +51,7 @@ class _User:
 class GeofenceMonitor:
     def __init__(self, db, clock=time.time, max_users=5000):
         self.db, self.clock, self.max_users = db, clock, max_users
+        self.deviation_tracker = RouteDeviationTracker(db=self.db, clock=self.clock)
         self._users = OrderedDict()
         self._guard = threading.Lock()
 
@@ -117,6 +119,28 @@ class GeofenceMonitor:
                     continue
                 if emitted:
                     out["alerts"].append(emitted)
+
+            # Route deviation evaluation if a trip travel_card_id is present
+            card_id = rec.get("travel_card_id")
+            if card_id and hasattr(self.db, "get_trip_route"):
+                try:
+                    trip_route = self.db.get_trip_route(card_id)
+                    if trip_route and trip_route.get("polyline"):
+                        dev_res = self.deviation_tracker.evaluate_fix(
+                            trip_id=card_id,
+                            user_id=uid,
+                            lat=sample.lat,
+                            lon=sample.lon,
+                            planned_polyline=trip_route["polyline"],
+                            trip_destination_name=trip_route.get("destination", "destination"),
+                            timestamp=ts,
+                        )
+                        out["deviation"] = dev_res
+                        if dev_res.get("alert_id") and dev_res.get("alert_action") == "raised":
+                            out["alerts"].append(dev_res["alert_id"])
+                except Exception:
+                    log.exception("Route deviation evaluation failed for trip %s", card_id)
+
             return out
         finally:
             u.lock.release()

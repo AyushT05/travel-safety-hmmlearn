@@ -9,7 +9,14 @@ from dataclasses import dataclass, field
 
 from . import config
 
-INDEPENDENT = {"zone_inside", "signal_lost", "prolonged_rest"}
+INDEPENDENT = {
+    "zone_inside",
+    "signal_lost",
+    "prolonged_rest",
+    "route_deviation",
+    "erratic_movement",
+    "distress_stop",
+}
 ZONE_BASE = {"info": 6, "warning": 18, "critical": 34}
 
 
@@ -70,6 +77,24 @@ def score_signals(signals, ctx):
         add(20 if rest.detail["tail_probability"] <= 0.02 else 15,
             f"unusually long rest ({round(rest.detail['duration_min'])} min)")
 
+    dev = by["route_deviation"][0] if "route_deviation" in by else None
+    if dev:
+        dev_m = dev.detail.get("deviation_m", 1800.0)
+        p = 15 if dev_m < 3000 else 22 if dev_m < 6000 else 28
+        add(p, f"deviated from planned route ({round(dev_m / 1000.0, 1)} km off)")
+
+    erratic = by["erratic_movement"][0] if "erratic_movement" in by else None
+    if erratic:
+        add(18, "erratic movement patterns detected")
+
+    stop = by["distress_stop"][0] if "distress_stop" in by else None
+    if stop:
+        add(20, "abrupt vehicle standstill in isolated sector")
+
+    pred = by["predictive_hazard"][0] if "predictive_hazard" in by else None
+    if pred:
+        add(12, f"trajectory projecting towards {pred.detail.get('category', 'hazard')} zone")
+
     # Correlation bonuses: this is where several weak signals become one strong one.
     if lost and (zone or lost.detail["near_zone_id"] is not None):
         add(25, "contact lost while inside or next to a verified hazard zone")
@@ -77,6 +102,18 @@ def score_signals(signals, ctx):
         add(15, "went silent after an unusually long stop")
     if rest and zone:
         add(10, "long stop inside a verified hazard zone")
+    if dev and lost:
+        add(25, "went silent after deviating from planned route")
+    if dev and zone:
+        add(25, "route deviation led into a verified hazard zone")
+    if dev and erratic:
+        add(18, "erratic trajectory while deviating from planned route")
+    if dev and rest:
+        add(15, "prolonged stop following route deviation")
+    if stop and ctx.get("night"):
+        add(10, "abrupt vehicle stop at night")
+    if erratic and zone:
+        add(15, "erratic movement near a verified hazard zone")
 
     kinds = sorted(k for k in by if k in INDEPENDENT)
     if len(kinds) >= 1:   # context only amplifies something that already exists

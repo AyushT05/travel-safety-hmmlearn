@@ -12,6 +12,7 @@ A snapshot is a plain dict:
 zones is a list of VERIFIED, unexpired unsafe_zones rows.
 """
 from dataclasses import dataclass, field
+import math
 from statistics import median
 
 from . import config
@@ -58,13 +59,18 @@ def extract_signals(snap, zones, now):
     sigs = []
     ctx = {"night": is_night(now), "has_fixes": bool(fixes), "last_fix": None, "age_s": None}
 
-    # Panic comes from alerts, independent of whether any fix exists.
+    # Panic and Deviation come from alerts, independent of whether any fix exists.
     for a in snap.get("alerts") or []:
         if a.get("type") == "panic" and a.get("status") in ("open", "acknowledged"):
             at = parse_ts(a["created_at"])
             sigs.append(Signal("panic", [f"alert:{a['id']}"], at,
                                f"Panic button pressed at {hhmm(at)}.",
                                {"alert_id": a["id"], "lat": a.get("lat"), "lon": a.get("lon")}))
+        elif a.get("type") == "deviation" and a.get("status") in ("open", "acknowledged"):
+            at = parse_ts(a["created_at"])
+            msg = a.get("message") or f"Route deviation detected at {hhmm(at)}."
+            sigs.append(Signal("route_deviation", [f"alert:{a['id']}"], at, msg,
+                               {"alert_id": a["id"], "lat": a.get("lat"), "lon": a.get("lon"), "deviation_m": 2000.0}))
 
     if not fixes:
         return sigs, ctx
@@ -150,5 +156,89 @@ def extract_signals(snap, zones, now):
         sigs.append(Signal("isolated_area", [f"assess:{snap['trip']['user_id']}"], last["t"],
                            "The area around the last position looks isolated (few roads, buildings or settlements).",
                            {"isolation_score": a["isolation_score"], "source": "client_triggered_assessment"}))
+
+    # --- erratic_movement: HSMM classification or sharp erratic velocity oscillations ---
+    act = snap.get("activity")
+    if act and act.get("current_state") == "ERRATIC":
+        sigs.append(Signal(
+            "erratic_movement", [f"act:{snap['trip'].get('id', 'trip')}"], last["t"],
+            "Erratic movement behavior detected by HSMM (unusual velocity fluctuations / direction swings).",
+            {"state": "ERRATIC", "duration_min": act.get("duration_minutes", 1)}))
+    elif len(fixes) >= 5:
+        # Check for rapid direction reversals (>120 deg) while moving
+        reversals = 0
+        for i in range(len(fixes) - 2):
+            f1, f2, f3 = fixes[i], fixes[i + 1], fixes[i + 2]
+            if (f1.get("speed") or 0) > 1.2 and (f2.get("speed") or 0) > 1.2:
+                # Approximate bearing change
+                b1 = math.atan2(f2["lon"] - f1["lon"], f2["lat"] - f1["lat"])
+                b2 = math.atan2(f3["lon"] - f2["lon"], f3["lat"] - f2["lat"])
+                diff = abs(math.degrees(b2 - b1))
+                if diff > 180:
+                    diff = 360 - diff
+                if diff >= 110:
+                    reversals += 1
+        if reversals >= 2:
+            sigs.append(Signal(
+                "erratic_movement", [f"loc:{last['id']}"], last["t"],
+                "Frequent sharp direction reversals and erratic movement detected.",
+                {"reversals": reversals}))
+
+    # --- distress_stop: sudden deceleration from vehicular speed to 0 in isolated/night setting ---
+    if len(fixes) >= 4 and lk and (lk.get("speed") or 0) < 0.5:
+        earlier_speeds = [f.get("speed") for f in fixes[-6:-2] if f.get("speed") is not None]
+        if earlier_speeds and max(earlier_speeds) >= 10.0:   # Was moving > 36 km/h
+            is_isolated = bool(a and (a.get("isolation_score") or 0) >= 0.4)
+            if ctx.get("night") or is_isolated:
+                sigs.append(Signal(
+                    "distress_stop", [f"loc:{last['id']}"], last["t"],
+                    f"Sudden stop from vehicular speed ({round(max(earlier_speeds) * 3.6)} km/h to standstill)"
+                    f" in an {'isolated sector' if is_isolated else 'unfamiliar area at night'}.",
+                    {"peak_speed_kmh": round(max(earlier_speeds) * 3.6, 1), "isolated": is_isolated}))
+
+    # --- predictive_hazard: heading projection into active verified hazard zones ---
+    if len(fixes) >= 2 and lk and (lk.get("speed") or 0) >= 2.5:
+        prev_f = fixes[-2]
+        dt = max(1.0, lk["t"] - prev_f["t"])
+        v_lat = (lk["lat"] - prev_f["lat"]) / dt
+        v_lon = (lk["lon"] - prev_f["lon"]) / dt
+        # Project 20 minutes (1200 seconds) ahead
+        proj_lat = lk["lat"] + v_lat * 1200.0
+        proj_lon = lk["lon"] + v_lon * 1200.0
+        for z in zones or []:
+            proj_dist = haversine_m(proj_lat, proj_lon, z["lat"], z["lon"])
+            r = (z.get("radius_m") or 500)
+            if proj_dist <= r + 400:
+                current_dist = haversine_m(lk["lat"], lk["lon"], z["lat"], z["lon"])
+                if current_dist > proj_dist:  # Moving towards it
+                    eta_min = round(max(1.0, (current_dist - r) / (lk.get("speed") * 60.0)))
+                    sigs.append(Signal(
+                        "predictive_hazard", [f"loc:{lk['id']}", f"zone:{z['id']}"], lk["t"],
+                        f"Predictive alert: Trajectory heading toward {z.get('category', 'hazard')} zone "
+                        f"({z.get('severity', 'warning')}) with estimated entry in ~{eta_min} min.",
+                        {"zone_id": z["id"], "category": z.get("category"), "eta_min": eta_min}))
+                    break
+
+    # --- route_deviation: if trip has planned route or place_details, verify adherence ---
+    has_dev_alert = any(s.kind == "route_deviation" for s in sigs)
+    if not has_dev_alert and lk:
+        trip = snap.get("trip") or {}
+        route = trip.get("planned_route")
+        polyline = route.get("polyline") if isinstance(route, dict) else None
+        if not polyline:
+            # Try to build from place_details if available
+            p_details = trip.get("place_details") or []
+            pts = [[float(p["lat"]), float(p["lon"])] for p in p_details if isinstance(p, dict) and p.get("lat") and p.get("lon")]
+            if len(pts) >= 2:
+                polyline = pts
+        if polyline and len(polyline) >= 2:
+            from geofence.deviation import calculate_cross_track
+            xt = calculate_cross_track(lk["lat"], lk["lon"], polyline)
+            if xt["distance_m"] >= 1800.0:
+                km_off = round(xt["distance_m"] / 1000.0, 1)
+                sigs.append(Signal(
+                    "route_deviation", [f"loc:{lk['id']}"], lk["t"],
+                    f"Tourist has deviated {km_off} km from planned route (progress {round(xt['progress_ratio'] * 100)}%).",
+                    {"deviation_m": xt["distance_m"], "deviation_km": km_off, "progress_ratio": xt["progress_ratio"]}))
 
     return sigs, ctx

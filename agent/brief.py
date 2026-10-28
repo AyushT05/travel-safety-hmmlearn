@@ -93,7 +93,8 @@ def unknowns_for(kind, signals, ctx):
     kinds = {s.kind for s in signals}
     if "signal_lost" in kinds:
         u.append("The cause of the signal loss is unknown (no coverage, low battery, device off, or app closed).")
-    u.append("Itinerary stops are not geocoded, so route deviation cannot be assessed.")
+    if "route_deviation" not in kinds and not ctx.get("has_route"):
+        u.append("Itinerary stops are not geocoded, so route deviation cannot be assessed.")
     if "poor_gps" in kinds:
         u.append("GPS accuracy is poor, so the last position may be off by tens of metres.")
     if "isolated_area" in kinds:

@@ -25,7 +25,7 @@ class AgentStore:
         today = datetime.fromtimestamp(now, tz=timezone.utc).date().isoformat()
         return self._get("travel_cards", {
             "status": "eq.active", "start_date": f"lte.{today}", "end_date": f"gte.{today}",
-            "select": "id,user_id,places,emergency_contacts,start_date,end_date"})
+            "select": "id,user_id,places,place_details,planned_route,emergency_contacts,start_date,end_date"})
 
     def active_trip_for_user(self, user_id, now):
         rows = [t for t in self.active_trips(now) if t["user_id"] == user_id]

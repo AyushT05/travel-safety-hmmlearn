@@ -66,12 +66,20 @@ from typing import Optional, Union
 import httpx
 import pymupdf
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from pipeline import process_ping, initial_state
 from state_store import InMemoryStateStore, SupabaseStateStore
 
-app = FastAPI()
+app = FastAPI(title="Margarakshak Safety & Routing Engine")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Loaded once, at import time, when the Render process boots. Every request
 # afterward reuses this same object; nothing here is retrained per request.
@@ -309,6 +317,122 @@ def geofence_sync_gdacs(x_webhook_secret: Optional[str] = Header(None)):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# -----------------------------------------------------------------------
+# Route determination, deviation analysis, and tourist safety scoring
+# -----------------------------------------------------------------------
+from geofence.route import plan_and_assess_route
+from geofence.deviation import calculate_cross_track
+
+class WaypointItem(BaseModel):
+    name: Optional[str] = "Waypoint"
+    lat: float
+    lon: float
+
+class RoutePlanRequest(BaseModel):
+    waypoints: list[WaypointItem]
+    travel_mode: Optional[str] = "driving"
+
+class DeviationCheckRequest(BaseModel):
+    lat: float
+    lon: float
+    polyline: list[list[float]]
+    trip_id: Optional[str] = None
+    user_id: Optional[str] = None
+
+class SafetyScoreRequest(BaseModel):
+    lat: float
+    lon: float
+    activity_state: Optional[str] = None
+    is_night: Optional[bool] = False
+    deviation_m: Optional[float] = 0.0
+    isolation_score: Optional[float] = 0.0
+    nearest_police_km: Optional[float] = None
+    nearest_hospital_km: Optional[float] = None
+
+
+@app.post("/route/plan")
+def route_plan(payload: RoutePlanRequest):
+    """Calculates road driving route between start, intermediate stops, and destination,
+    and returns waypoint milestones, turn-by-turn road polyline, and risk assessment."""
+    wps = [wp.model_dump() for wp in payload.waypoints]
+    if len(wps) < 2:
+        raise HTTPException(status_code=400, detail="At least 2 waypoints are required")
+    # Fetch nearby zones if store is configured
+    zones = None
+    if isinstance(STORE, SupabaseStateStore) and hasattr(_geofence_monitor(), "db"):
+        try:
+            zones = _geofence_monitor().db.zones_near(wps[0]["lat"], wps[0]["lon"])
+        except Exception:
+            zones = None
+    result = plan_and_assess_route(wps, zones=zones, travel_mode=payload.travel_mode or "driving")
+    if not result.get("success"):
+        raise HTTPException(status_code=422, detail=result.get("error", "Route planning failed"))
+    return result
+
+
+@app.post("/route/deviation")
+def route_deviation(payload: DeviationCheckRequest):
+    """Calculates cross-track distance from ping to polyline and evaluates deviation status."""
+    if not payload.polyline:
+        raise HTTPException(status_code=400, detail="Polyline required")
+    xt = calculate_cross_track(payload.lat, payload.lon, payload.polyline)
+    dev_m = xt["distance_m"]
+    status = "on_route" if dev_m <= 500.0 else "caution" if dev_m <= 1500.0 else "deviated"
+    return {
+        "status": status,
+        "deviation_distance_m": dev_m,
+        "closest_point": xt["closest_point"],
+        "progress_pct": round(xt["progress_ratio"] * 100.0, 1),
+    }
+
+
+@app.post("/safety/tourist-score")
+def tourist_safety_score(payload: SafetyScoreRequest):
+    """Calculates the transparent 0-100 Tourist Safety Score."""
+    score = 100.0
+    penalties = []
+
+    dev_m = payload.deviation_m or 0.0
+    if dev_m > 1800.0:
+        p = min(35.0, 15.0 + (dev_m - 1800.0) / 200.0)
+        score -= p
+        penalties.append(f"-{round(p)}: Route deviation ({round(dev_m / 1000.0, 1)} km off planned route)")
+    elif dev_m > 500.0:
+        score -= 10.0
+        penalties.append(f"-10: Detour from corridor ({round(dev_m)} m)")
+
+    if payload.activity_state == "ERRATIC":
+        score -= 25.0
+        penalties.append("-25: Erratic movement pattern detected")
+    elif payload.activity_state == "RESTING" and payload.is_night:
+        score -= 10.0
+        penalties.append("-10: Stationary during night hours")
+
+    iso = payload.isolation_score or 0.0
+    if iso > 0.6:
+        p = round(iso * 20.0)
+        score -= p
+        penalties.append(f"-{p}: Remote / isolated area")
+
+    if payload.nearest_police_km is not None and payload.nearest_police_km > 15.0:
+        score -= 10.0
+        penalties.append(f"-10: Distant emergency services ({round(payload.nearest_police_km, 1)} km to police)")
+
+    if payload.is_night and (iso > 0.4 or dev_m > 1000.0):
+        score -= 10.0
+        penalties.append("-10: Nocturnal travel risk in unfamiliar sector")
+
+    final_score = max(5.0, min(100.0, round(score, 1)))
+    status = "safe" if final_score >= 80.0 else "caution" if final_score >= 50.0 else "unsafe"
+
+    return {
+        "safety_score": final_score,
+        "status": status,
+        "risk_score": round(100.0 - final_score, 1),
+        "penalties": penalties,
+    }
 
 
 # -----------------------------------------------------------------------
