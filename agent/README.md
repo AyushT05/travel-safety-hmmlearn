@@ -38,3 +38,18 @@ warnings, battery level as a signal, automated check-in ("are you OK?") workflow
 
 ## Tests
 `pip install -r requirements-dev.txt && python -m pytest tests`
+
+## AI trip analyst (insights.py, situation.py, context.py)
+
+Every tick, for each active trip: `situation.analyse` works out where the traveller is (reverse-geocoded place),
+where they are heading, route adherence, movement, and abnormal events (abrupt stop, signal loss / repeated gaps /
+restored, route deviation + trend, long unplanned stop, circling, erratic movement, high speed, GPS jump, hazard zone,
+approaching hazard, unsafe area, the traveller's own "I'm OK" / "I need help" replies). Status
+(normal/watch/alert) is deterministic. The LLM only explains it in words and drafts the message to the traveller;
+output that asserts harm, cites an unknown event/action or contains a phone number/link is discarded for the template.
+Results: `trip_insights` (admin console), `user_notifications` (traveller's phone).
+
+Env: `LLM_PROVIDER=groq|gemini`, `LLM_API_KEY` (or `GROQ_API_KEY` / `GEMINI_API_KEY`), `LLM_MODEL` (required; check the
+provider's current model list), optional `LLM_BASE_URL`. Optional `GEOAPIFY_API_KEY` for place names and service phone numbers.
+Without an LLM the template analysis and notifications still work.
+Migration: `supabase_migrations/20261101_trip_insights_and_notifications.sql`.

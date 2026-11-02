@@ -13,6 +13,8 @@ import logging
 import threading
 
 from . import config
+from .context import likely_issues, weather_now
+from .services import emergency_numbers
 from .brief import (SYSTEM_PROMPT, BriefRejected, build_packet, build_user_message, playbook,
                     template_brief, validate_llm_brief)
 from .llm import LLMUnavailable
@@ -44,8 +46,10 @@ def _run_inline(fn, *a, **kw):
 
 
 class Engine:
-    def __init__(self, store, llm, find_services, clock, submit=None):
+    def __init__(self, store, llm, find_services, clock, submit=None, insights=None, geocode=None):
         self.store, self.llm, self.find_services, self.clock = store, llm, find_services, clock
+        self.geocode = geocode                         # (lat, lon) -> {name, kind, ...} | None
+        self.insights = insights                       # optional InsightService (AI trip analyst)
         self.submit = submit or _run_inline          # production passes a thread-pool submit
 
     # ------------------------------------------------------------------ tick
@@ -57,6 +61,8 @@ class Engine:
         zones = self.store.zones(now)
         trips = self.store.active_trips(now)
         by_zone = {}
+        if self.insights:
+            self.insights.begin_tick()
 
         for trip in trips:
             stats["trips"] += 1
@@ -64,6 +70,8 @@ class Engine:
                 snap = self.store.snapshot(trip, now)
                 signals, ctx = extract_signals(snap, zones, now)
                 signals = [s for s in signals if s.kind != "panic"]      # panic has its own incident
+                if self.insights:
+                    signals += self._analyst(trip, snap, zones, now, stats)
                 res = score_signals(signals, ctx)
                 lk = _lk_dict(ctx.get("last_known"), now)
                 self._sync(f"trip:{trip['id']}", "trip_risk", res, signals, ctx, trip, now, stats, lk,
@@ -86,6 +94,17 @@ class Engine:
             stats["errors"] += 1
             log.exception("tick tail failed")
         return stats
+
+    def _analyst(self, trip, snap, zones, now, stats):
+        """Run the AI trip analyst (never raises); its watch/alert stop and loop findings also feed incident scoring."""
+        try:
+            _, events, _ = self.insights.process(trip, snap, zones, now, stats)
+        except Exception:  # noqa: BLE001
+            stats["errors"] += 1
+            log.exception("insights failed for trip %s", trip.get("id"))
+            return []
+        return [Signal(e.kind, e.evidence_ids, e.at, e.text, {**e.detail, "severity": e.severity})
+                for e in events if e.kind in ("abrupt_stop", "circling", "unplanned_stop") and e.severity != "info"]
 
     # --------------------------------------------------------- incident sync
     def _sync(self, key, kind, res, signals, ctx, trip, now, stats, last_known_d, base, cluster=None):
@@ -149,7 +168,11 @@ class Engine:
         tmpl = template_brief(packet, steps, now)
         self.store.update_incident(inc["id"], {"brief": tmpl, "brief_source": "template",
                                                "brief_generated_at": tmpl["generated_at"], "brief_error": None})
-        if queue_llm:
+        if queue_llm and kind == "trip_risk" and res.level == "high" and lk:
+            # An automatically detected high-priority situation is treated like an SOS: place name, location-based
+            # likely causes, shared contacts and nearby services are attached off the tick thread, then the LLM wording runs.
+            self.submit(self._panic_phase2, inc, res, signals, ctx, trip, now, lk, None, None, "trip_risk")
+        elif queue_llm:
             self._queue_llm(inc["id"], packet, tmpl, now, stats)
 
     def _queue_llm(self, incident_id, packet, tmpl, now, stats=None):
@@ -247,26 +270,60 @@ class Engine:
         if not inc:
             return {"skipped": "race"}
         # Phase 1: complete template brief, DB only. No external call has happened yet.
+        self._extra = {"contacts_shared": _contacts(trip), "emergency_numbers": emergency_numbers(),
+                       "sos_source": alert.get("source") or "app"}
         self._brief(inc, "panic", res, signals, ctx, trip, now, lk, None, force=True, stats=None, queue_llm=False)
+        self.store.update_incident(inc["id"], {"brief": {**((self.store.find_incident(key) or {}).get("brief") or {}), **self._extra}})
         # Phase 2 (never blocks the above): nearby services, then LLM polish.
         if lk:
-            self.submit(self._panic_phase2, inc, res, signals, ctx, trip, now, lk)
+            self.submit(self._panic_phase2, inc, res, signals, ctx, trip, now, lk, alert, snap)
         return {"incident_id": inc["id"], "level": "critical"}
 
-    def _panic_phase2(self, inc, res, signals, ctx, trip, now, lk):
-        try:
-            services = self.find_services(lk["lat"], lk["lon"])
-        except Exception:  # noqa: BLE001
-            services = []
+    def _panic_phase2(self, inc, res, signals, ctx, trip, now, lk, alert=None, snap=None, kind="panic"):
+        def safe(fn, default, *a):
+            try:
+                return fn(*a) or default
+            except Exception:  # noqa: BLE001
+                return default
+        services = safe(self.find_services, [], lk["lat"], lk["lon"])
+        place = safe(self.geocode, None, lk["lat"], lk["lon"]) if self.geocode else None
+        weather = safe(weather_now, {}, lk["lat"], lk["lon"])
+        zones = safe(self.store.zones, [], now)
+        events = [{"kind": s.kind, "detail": s.detail} for s in signals]
+        issues = likely_issues(place, ctx.get("night"), zones, lk["lat"], lk["lon"], (snap or {}).get("assessment"), events,
+                               weather, (alert or {}).get("source"))
+        lk = {**lk, "location_name": (place or {}).get("name"), "place_kind": (place or {}).get("kind")}
         n_contacts = len((trip or {}).get("emergency_contacts") or [])
-        packet = build_packet("panic", res.level, res.score, res.reasons, signals, ctx, trip, now,
+        packet = build_packet(kind, res.level, res.score, res.reasons, signals, ctx, trip, now,
                               last_known=lk, nearby=services)
-        tmpl = template_brief(packet, playbook("panic", res.level, set(res.kinds), n_contacts), now)
+        packet["likely_issues"] = [{"id": i["id"], "issue": i["issue"], "why": i["why"]} for i in issues]
+        tmpl = template_brief(packet, playbook(kind, res.level, set(res.kinds), n_contacts), now)
+        tmpl.update({"likely_issues": issues, "contacts_shared": _contacts(trip), "emergency_numbers": emergency_numbers(),
+                     "sos_source": ((alert or {}).get("source") or "app") if kind == "panic" else "auto", "last_known": lk,
+                     "conditions": {"weather": {k: weather.get(k) for k in ("weather_code", "precipitation", "wind_gusts_10m", "apparent_temperature", "visibility")} if weather else None,
+                                    "night": ctx.get("night")}})
         tmpl["generated_at"] = iso(now + 0.001)         # newer than phase 1, so it replaces it
         self.store.update_incident(inc["id"], {"brief": tmpl, "brief_source": "template",
                                                "brief_generated_at": tmpl["generated_at"], "brief_error": None})
         self._llm_budget = 1
         self._queue_llm(inc["id"], packet, tmpl, now)
+
+
+def _contacts(trip):
+    """Numbers the traveller shared on their travel card (shown to the admin; never sent to the LLM)."""
+    out = []
+    for c in (trip or {}).get("emergency_contacts") or []:
+        if isinstance(c, dict) and (c.get("phone") or c.get("mobile") or c.get("number")):
+            out.append({"role": "emergency_contact", "name": str(c.get("name") or "")[:60] or None,
+                        "relation": str(c.get("relation") or c.get("relationship") or "")[:30] or None,
+                        "phone": str(c.get("phone") or c.get("mobile") or c.get("number"))[:30]})
+    if (trip or {}).get("mobile"):
+        out.insert(0, {"role": "traveller", "name": (trip.get("full_name") or "")[:60] or None, "relation": None, "phone": str(trip["mobile"])[:30]})
+    for c in (trip or {}).get("companions") or []:
+        if isinstance(c, dict) and (c.get("phone") or c.get("mobile")):
+            out.append({"role": "companion", "name": str(c.get("name") or "")[:60] or None, "relation": None,
+                        "phone": str(c.get("phone") or c.get("mobile"))[:30]})
+    return out
 
 
 class _Res:

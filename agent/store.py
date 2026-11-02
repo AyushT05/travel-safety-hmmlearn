@@ -25,7 +25,7 @@ class AgentStore:
         today = datetime.fromtimestamp(now, tz=timezone.utc).date().isoformat()
         return self._get("travel_cards", {
             "status": "eq.active", "start_date": f"lte.{today}", "end_date": f"gte.{today}",
-            "select": "id,user_id,places,place_details,planned_route,emergency_contacts,start_date,end_date"})
+            "select": "id,user_id,full_name,mobile,places,place_details,planned_route,emergency_contacts,companions,start_date,end_date"})
 
     def active_trip_for_user(self, user_id, now):
         rows = [t for t in self.active_trips(now) if t["user_id"] == user_id]
@@ -46,8 +46,8 @@ class AgentStore:
             act = []
         alerts = self._get("alerts", {
             "user_id": f"eq.{trip['user_id']}", "created_at": f"gte.{iso(now - 6 * 3600)}",
-            "select": "id,type,severity,status,created_at,lat,lon,message"})
-        assess = self._get("safety_assessments", {"user_id": f"eq.{trip['user_id']}", "select": "isolation_score,safety_status,assessed_at"})
+            "select": "id,type,severity,status,created_at,lat,lon,message,source"})
+        assess = self._get("safety_assessments", {"user_id": f"eq.{trip['user_id']}", "select": "isolation_score,safety_status,assessed_at,hazard_zones,risk_factors"})
         return {"trip": trip, "locations": locs, "activity": act[0] if act else None,
                 "alerts": alerts, "assessment": assess[0] if assess else None}
 
@@ -61,7 +61,7 @@ class AgentStore:
                                     "select": "id,user_id,type,severity,status,created_at,lat,lon,message"})
 
     def get_alert(self, alert_id):
-        rows = self._get("alerts", {"id": f"eq.{alert_id}", "select": "id,user_id,type,severity,status,created_at,lat,lon,message"})
+        rows = self._get("alerts", {"id": f"eq.{alert_id}", "select": "id,user_id,type,severity,status,created_at,lat,lon,message,source"})
         return rows[0] if rows else None
 
     # ---- incidents
@@ -96,3 +96,38 @@ class AgentStore:
         r.raise_for_status()
         rows = r.json()
         return rows[0] if rows else None
+
+    # ---- AI trip insights + traveller notifications
+    def insights(self):
+        return self._get("trip_insights", {"select": "*"})
+
+    def get_insight(self, trip_id):
+        rows = self._get("trip_insights", {"travel_card_id": f"eq.{trip_id}", "select": "*"})
+        return rows[0] if rows else None
+
+    def upsert_insight(self, row):
+        r = self.http.post(f"{self.base}/trip_insights", params={"on_conflict": "travel_card_id"},
+                           headers={**self.h, "Prefer": "resolution=merge-duplicates,return=minimal"}, json=row)
+        r.raise_for_status()
+
+    def patch_insight(self, trip_id, patch, where=None):
+        params = {"travel_card_id": f"eq.{trip_id}", **{k: f"eq.{v}" for k, v in (where or {}).items()}}
+        r = self.http.patch(f"{self.base}/trip_insights", headers={**self.h, "Prefer": "return=minimal"},
+                            params=params, json=patch)
+        r.raise_for_status()
+
+    def notification_responses(self, trip_id, since_epoch):
+        return self._get("user_notifications", {
+            "travel_card_id": f"eq.{trip_id}", "response": "not.is.null", "responded_at": f"gte.{iso(since_epoch)}",
+            "order": "responded_at.desc", "select": "id,kind,response,responded_at"})
+
+    def recent_notifications(self, trip_id, since_epoch):
+        return self._get("user_notifications", {
+            "travel_card_id": f"eq.{trip_id}", "created_at": f"gte.{iso(since_epoch)}",
+            "order": "created_at.desc", "select": "id,kind,created_at,response,responded_at"})
+
+    def insert_notification(self, row):
+        r = self.http.post(f"{self.base}/user_notifications", headers={**self.h, "Prefer": "return=minimal"}, json=row)
+        if r.status_code == 409:
+            return
+        r.raise_for_status()

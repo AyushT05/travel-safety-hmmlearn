@@ -204,6 +204,8 @@ from agent.engine import Engine
 from agent.llm import LLMClient
 from agent.services import find_nearby_services
 from agent.store import AgentStore
+from agent.geocode import reverse as _reverse_geocode
+from agent.insights import InsightService
 
 _AGENT_POOL = ThreadPoolExecutor(max_workers=2)
 _AGENT = None
@@ -226,7 +228,10 @@ def _agent():
         if _AGENT is None:
             if not os.environ.get("SUPABASE_URL"):
                 raise HTTPException(status_code=503, detail="agent requires SUPABASE_URL")
-            _AGENT = Engine(AgentStore(), LLMClient(), find_nearby_services, _time.time, submit=_agent_submit)
+            store, llm = AgentStore(), LLMClient()
+            insights = InsightService(store, llm, _reverse_geocode, _time.time, submit=_agent_submit)
+            _AGENT = Engine(store, llm, find_nearby_services, _time.time, submit=_agent_submit,
+                            insights=insights, geocode=_reverse_geocode)
         return _AGENT
 
 

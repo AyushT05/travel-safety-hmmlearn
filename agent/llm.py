@@ -13,6 +13,10 @@ import time
 import httpx
 
 
+PROVIDER_URLS = {"groq": "https://api.groq.com/openai/v1",
+                 "gemini": "https://generativelanguage.googleapis.com/v1beta/openai"}
+
+
 class LLMUnavailable(Exception):
     pass
 
@@ -21,8 +25,13 @@ class LLMClient:
     def __init__(self, api_key=None, base_url=None, model=None, timeout=20.0,
                  fail_threshold=3, cooldown_s=120):
         self.api_key = api_key or os.environ.get("LLM_API_KEY") or os.environ.get("GROQ_API_KEY")
-        self.base_url = (base_url or os.environ.get("LLM_BASE_URL") or "https://api.groq.com/openai/v1").rstrip("/")
-        # Model slugs rotate; deliberately no hardcoded default. Unset means LLM briefs are off.
+        # LLM_PROVIDER=groq|gemini picks the OpenAI-compatible endpoint (Gemini exposes one). LLM_BASE_URL overrides.
+        provider = (os.environ.get("LLM_PROVIDER") or "groq").lower()
+        if provider == "gemini" and not os.environ.get("LLM_API_KEY"):
+            self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or self.api_key
+        self.provider = provider
+        self.base_url = (base_url or os.environ.get("LLM_BASE_URL") or PROVIDER_URLS.get(provider, PROVIDER_URLS["groq"])).rstrip("/")
+        # Model slugs rotate, so set LLM_MODEL explicitly (see agent/README). Unset means LLM wording is off.
         self.model = model or os.environ.get("LLM_MODEL")
         self.timeout = timeout
         self._fails = 0
@@ -42,14 +51,14 @@ class LLMClient:
             if time.monotonic() < self._open_until:
                 raise LLMUnavailable("circuit open")
         try:
-            r = httpx.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": self.model, "temperature": 0.2, "max_tokens": 1000,
-                      "response_format": {"type": "json_object"},
-                      "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]},
-                timeout=self.timeout,
-            )
+            body = {"model": self.model, "temperature": 0.2, "max_tokens": 1200,
+                    "response_format": {"type": "json_object"},
+                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+            url, hdr = f"{self.base_url}/chat/completions", {"Authorization": f"Bearer {self.api_key}"}
+            r = httpx.post(url, headers=hdr, json=body, timeout=self.timeout)
+            if r.status_code == 400:                      # some models reject JSON mode: retry; the parser tolerates fences
+                body.pop("response_format")
+                r = httpx.post(url, headers=hdr, json=body, timeout=self.timeout)
             r.raise_for_status()
             text = r.json()["choices"][0]["message"]["content"]
             out = _extract_json(text)

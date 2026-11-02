@@ -16,6 +16,9 @@ INDEPENDENT = {
     "route_deviation",
     "erratic_movement",
     "distress_stop",
+    "abrupt_stop",
+    "circling",
+    "unplanned_stop",
 }
 ZONE_BASE = {"info": 6, "warning": 18, "critical": 34}
 
@@ -90,6 +93,14 @@ def score_signals(signals, ctx):
     stop = by["distress_stop"][0] if "distress_stop" in by else None
     if stop:
         add(20, "abrupt vehicle standstill in isolated sector")
+
+    if "abrupt_stop" in by and "distress_stop" not in by:        # the analyst's richer stop detection
+        sev = by["abrupt_stop"][0].detail.get("severity")
+        add(22 if sev == "alert" else 14, "abrupt vehicle stop followed by no movement")
+    if "circling" in by:
+        add(12, "moving in circles")
+    if "unplanned_stop" in by:
+        add(18 if by["unplanned_stop"][0].detail.get("severity") == "alert" else 12, "long stop away from any planned stop")
 
     pred = by["predictive_hazard"][0] if "predictive_hazard" in by else None
     if pred:
