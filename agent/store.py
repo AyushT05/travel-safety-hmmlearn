@@ -23,9 +23,13 @@ class AgentStore:
     # ---- reads
     def active_trips(self, now):
         today = datetime.fromtimestamp(now, tz=timezone.utc).date().isoformat()
-        return self._get("travel_cards", {
-            "status": "eq.active", "start_date": f"lte.{today}", "end_date": f"gte.{today}",
-            "select": "id,user_id,full_name,mobile,places,place_details,planned_route,emergency_contacts,companions,start_date,end_date"})
+        params = {"status": "eq.active", "start_date": f"lte.{today}", "end_date": f"gte.{today}"}
+        base = "id,user_id,full_name,mobile,places,place_details,planned_route,emergency_contacts,companions,start_date,end_date"
+        try:
+            return self._get("travel_cards", {**params, "select": base + ",transport_mode,departure_time,eta_plan,return_date"})
+        except httpx.HTTPStatusError:
+            # Migration 20261106 not applied yet: keep working without the transport columns.
+            return self._get("travel_cards", {**params, "select": base})
 
     def active_trip_for_user(self, user_id, now):
         rows = [t for t in self.active_trips(now) if t["user_id"] == user_id]

@@ -18,6 +18,7 @@ from statistics import median
 from . import config
 from .geo import haversine_m
 from .util import parse_ts, is_night, hhmm
+from .breaks import within_expected_break
 
 
 @dataclass
@@ -135,7 +136,11 @@ def extract_signals(snap, zones, now):
         upd = parse_ts(act["updated_at"])
         dur = act.get("duration_minutes")
         tail = act.get("tail_probability")
-        if (dur is not None and tail is not None and upd >= last["t"] - 120
+        # A meal / tea / rest halt that the trip plan expects is not "unusual" however rare the model
+        # finds a long stationary stretch; it is only excused while it is within that allowance.
+        expected, _allow, _why = (within_expected_break(snap.get("trip"), upd - dur * 60, dur * 60)
+                                  if dur is not None else (False, 0, None))
+        if (dur is not None and tail is not None and upd >= last["t"] - 120 and not expected
                 and dur >= config.REST_MIN_DURATION_MIN and tail <= config.REST_TAIL_P):
             sigs.append(Signal(
                 "prolonged_rest", [f"act:{snap['trip']['id']}"], upd - dur * 60,

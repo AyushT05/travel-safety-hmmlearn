@@ -17,6 +17,7 @@ from . import config
 from .geo import haversine_m
 from .signals import _fixes, _is_good, last_known
 from .util import hhmm, is_night, parse_ts
+from .breaks import within_expected_break
 
 SEV_RANK = {"info": 0, "watch": 1, "alert": 2}
 
@@ -273,7 +274,8 @@ def analyse(snap, zones, now, place_of=None, responses=None):
            {**{k: abrupt[k] for k in ("from_kmh", "drop_s", "hard")}, "stationary_s": round(stopped_s), "planned": planned,
             "risky_place": bool(risky)},
            [f"loc:{abrupt['id']}"], notify=(sev != "info"))
-    elif state == "stopped" and stopped_s >= UNPLANNED_STOP_MIN * 60 and not at_planned_stop and not services_here:
+    elif (state == "stopped" and stopped_s >= UNPLANNED_STOP_MIN * 60 and not at_planned_stop and not services_here
+          and not within_expected_break(snap.get("trip"), stationary_since, stopped_s)[0]):
         sev = "alert" if ((night or isolated) and stopped_s >= 40 * 60) else "watch"
         ev("unplanned_stop", sev, stationary_since,
            f"Stationary {where} for {_fmt_dur(stopped_s)}, not at a planned stop.",
