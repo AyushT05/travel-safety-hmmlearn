@@ -473,6 +473,23 @@ def pdf_to_image(payload: PdfRenderRequest, x_webhook_secret: Optional[str] = He
         raise HTTPException(status_code=400, detail=f"Could not render PDF: {e}")
 
 
+class DocTextRequest(BaseModel):
+    fileBase64: str
+    mimeType: str = "image/jpeg"
+
+
+@app.post("/document/text")
+def document_text(payload: DocTextRequest, x_webhook_secret: Optional[str] = Header(None)):
+    """Text of an uploaded ID document without any AI: PDF text layer, else OCR. See docs_text.py."""
+    _check_webhook_secret(x_webhook_secret)
+    import docs_text
+    try:
+        out = docs_text.extract_text(payload.fileBase64, payload.mimeType)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Could not read document: {type(e).__name__}")
+    return {**out, "ocr_available": docs_text.ocr_available()}
+
+
 @app.post("/score")
 def score(payload: SupabaseWebhookPayload, x_webhook_secret: Optional[str] = Header(None)):
     _check_webhook_secret(x_webhook_secret)

@@ -17,6 +17,9 @@ PROVIDER_URLS = {"groq": "https://api.groq.com/openai/v1",
                  "gemini": "https://generativelanguage.googleapis.com/v1beta/openai"}
 
 
+DEFAULT_MODELS = {"groq": "llama-3.3-70b-versatile", "gemini": "gemini-flash-latest"}
+
+
 class LLMUnavailable(Exception):
     pass
 
@@ -31,8 +34,10 @@ class LLMClient:
             self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or self.api_key
         self.provider = provider
         self.base_url = (base_url or os.environ.get("LLM_BASE_URL") or PROVIDER_URLS.get(provider, PROVIDER_URLS["groq"])).rstrip("/")
-        # Model slugs rotate, so set LLM_MODEL explicitly (see agent/README). Unset means LLM wording is off.
-        self.model = model or os.environ.get("LLM_MODEL")
+        # LLM_MODEL overrides. Unset now falls back to a sensible default per provider instead of silently turning the
+        # AI summary OFF (which left SOS incidents with only the plain template text). Model slugs rotate: if the
+        # provider retires one, set LLM_MODEL on Render rather than editing code.
+        self.model = model or os.environ.get("LLM_MODEL") or DEFAULT_MODELS.get(provider)
         self.timeout = timeout
         self._fails = 0
         self._open_until = 0.0

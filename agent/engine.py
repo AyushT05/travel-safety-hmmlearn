@@ -58,6 +58,7 @@ class Engine:
         stats = {"trips": 0, "created": 0, "updated": 0, "cleared": 0, "suppressed": 0,
                  "panic_recovered": 0, "errors": 0, "llm_queued": 0}
         self._llm_budget = config.MAX_LLM_BRIEFS_PER_TICK
+        self._recover_panics(now, stats)
         zones = self.store.zones(now)
         trips = self.store.active_trips(now)
         by_zone = {}
@@ -86,14 +87,26 @@ class Engine:
         try:
             self._clusters(by_zone, zones, now, stats)
             self._close_orphans(trips, stats, now)
-            for alert in self.store.open_panic_alerts(now):
-                if not self.store.find_incident(f"panic:{alert['id']}"):
-                    self.handle_panic(alert["id"])
-                    stats["panic_recovered"] += 1
         except Exception:  # noqa: BLE001
             stats["errors"] += 1
             log.exception("tick tail failed")
         return stats
+
+    def _recover_panics(self, now, stats):
+        """An SOS whose webhook was lost (Render asleep, secret mismatch, pg_net timeout) still becomes an incident
+        within one tick. Runs FIRST and on its own so a failure anywhere else in tick() can never block it."""
+        try:
+            for alert in self.store.open_panic_alerts(now):
+                try:
+                    if not self.store.find_incident(f"panic:{alert['id']}"):
+                        self.handle_panic(alert["id"])
+                        stats["panic_recovered"] += 1
+                except Exception:  # noqa: BLE001
+                    stats["errors"] += 1
+                    log.exception("panic recovery failed for alert %s", alert.get("id"))
+        except Exception:  # noqa: BLE001
+            stats["errors"] += 1
+            log.exception("could not list open panic alerts")
 
     def _analyst(self, trip, snap, zones, now, stats):
         """Run the AI trip analyst (never raises); its watch/alert stop and loop findings also feed incident scoring."""
@@ -245,10 +258,30 @@ class Engine:
         if self.store.find_incident(key):
             return {"skipped": "already_handled"}
 
-        trip = self.store.active_trip_for_user(alert["user_id"], now) or \
-            {"id": None, "user_id": alert["user_id"], "places": [], "emergency_contacts": []}
-        snap = self.store.snapshot(trip, now)
-        signals, ctx = extract_signals(snap, self.store.zones(now), now)
+        try:
+            trip = self.store.active_trip_for_user(alert["user_id"], now)
+        except Exception:  # noqa: BLE001
+            log.exception("panic %s: trip lookup failed", alert_id)
+            trip = None
+        # Prefer the card the SOS was raised on (the phone sends it) over "whatever trip is active today".
+        trip = trip or {"id": alert.get("travel_card_id"), "user_id": alert["user_id"], "places": [], "emergency_contacts": []}
+        # The incident itself needs only the alert row. Trail, activity state and zones are context: if any of those
+        # reads fails (missing table, bad migration, timeout) we still open the incident with what we have.
+        try:
+            snap = self.store.snapshot(trip, now)
+        except Exception:  # noqa: BLE001
+            log.exception("panic %s: snapshot failed, continuing without trail", alert_id)
+            snap = {"trip": trip, "locations": [], "activity": None, "alerts": [alert], "assessment": None}
+        try:
+            zones_now = self.store.zones(now)
+        except Exception:  # noqa: BLE001
+            log.exception("panic %s: zones failed", alert_id)
+            zones_now = []
+        try:
+            signals, ctx = extract_signals(snap, zones_now, now)
+        except Exception:  # noqa: BLE001
+            log.exception("panic %s: signal extraction failed", alert_id)
+            signals, ctx = [], {"night": None, "has_route": False}
         res = score_signals(signals, ctx)                                # -> critical (panic present)
 
         # Latest reliable location: newest of the alert's own GPS fix and the newest usable tracked fix.
@@ -297,6 +330,14 @@ class Engine:
         packet = build_packet(kind, res.level, res.score, res.reasons, signals, ctx, trip, now,
                               last_known=lk, nearby=services)
         packet["likely_issues"] = [{"id": i["id"], "issue": i["issue"], "why": i["why"]} for i in issues]
+        # History the admin needs to judge WHY the SOS was pressed: what else happened in the last 6 hours, and the
+        # trip's activity state. (Types/times only: no names or phone numbers ever go into the packet.)
+        packet["recent_alerts"] = [{"type": a.get("type"), "severity": a.get("severity"), "status": a.get("status"),
+                                    "at": a.get("created_at")} for a in ((snap or {}).get("alerts") or [])
+                                   if not (alert and str(a.get("id")) == str(alert.get("id")))][:8]
+        act = (snap or {}).get("activity") or {}
+        if act.get("current_state"):
+            packet["activity"] = {"state": act.get("current_state"), "minutes": act.get("duration_minutes")}
         tmpl = template_brief(packet, playbook(kind, res.level, set(res.kinds), n_contacts), now)
         tmpl.update({"likely_issues": issues, "contacts_shared": _contacts(trip), "emergency_numbers": emergency_numbers(),
                      "sos_source": ((alert or {}).get("source") or "app") if kind == "panic" else "auto", "last_known": lk,

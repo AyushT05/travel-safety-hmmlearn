@@ -22,7 +22,8 @@ class AgentStore:
 
     # ---- reads
     def active_trips(self, now):
-        today = datetime.fromtimestamp(now, tz=timezone.utc).date().isoformat()
+        # Trip dates are India dates (the database compares in Asia/Kolkata); UTC made a trip look "not started" until 05:30.
+        today = datetime.fromtimestamp(now + 19800, tz=timezone.utc).date().isoformat()
         params = {"status": "eq.active", "start_date": f"lte.{today}", "end_date": f"gte.{today}"}
         base = "id,user_id,full_name,mobile,places,place_details,planned_route,emergency_contacts,companions,start_date,end_date"
         try:
@@ -65,7 +66,11 @@ class AgentStore:
                                     "select": "id,user_id,type,severity,status,created_at,lat,lon,message"})
 
     def get_alert(self, alert_id):
-        rows = self._get("alerts", {"id": f"eq.{alert_id}", "select": "id,user_id,type,severity,status,created_at,lat,lon,message,source"})
+        cols = "id,user_id,type,severity,status,created_at,lat,lon,message,source,travel_card_id,location_accuracy"
+        try:
+            rows = self._get("alerts", {"id": f"eq.{alert_id}", "select": cols})
+        except httpx.HTTPStatusError:      # an older schema without some columns: retry with the originals
+            rows = self._get("alerts", {"id": f"eq.{alert_id}", "select": "id,user_id,type,severity,status,created_at,lat,lon,message"})
         return rows[0] if rows else None
 
     # ---- incidents

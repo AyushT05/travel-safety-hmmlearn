@@ -196,9 +196,11 @@ class RouteDeviationTracker:
                 # Raise alert if not already open
                 if state.last_alert_id is None and self.db is not None:
                     km_off = round(dev_m / 1000.0, 1)
+                    # progress_ratio (position along the route) is still returned in the metrics, but it is not put in
+                    # the message: "Progress: 0%" only meant "the nearest route point is the route's start".
                     message = (
-                        f"Route deviation detected: Traveller is {km_off} km off planned route "
-                        f"towards {trip_destination_name}. (Progress: {round(xt['progress_ratio'] * 100)}%)."
+                        f"Route deviation detected: Traveller is {km_off} km off the planned route "
+                        f"towards {trip_destination_name}."
                     )
                     alert_payload = {
                         "user_id": user_id,
